@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shared item — VAULTIXgusTAR</title>
+<link rel="stylesheet" href="/styles.css" />
+<style>
+  body { min-height: 100vh; background: linear-gradient(180deg, #0F172A 0%, #111C36 100%); display: flex; align-items: center; justify-content: center; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif; }
+  .box { width: 100%; max-width: 420px; }
+  .card { background: #fff; border-radius: 16px; padding: 26px; box-shadow: 0 24px 60px rgba(0,0,0,.3); }
+  .row { padding: 10px 0; border-bottom: 1px solid #E2E8F0; }
+  .row:last-child { border-bottom: none; }
+  .row label { display: block; font-size: 12px; font-weight: 700; color: #64748B; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .row div { font-size: 14px; color: #1E293B; white-space: pre-wrap; word-break: break-word; }
+  .note { text-align: center; color: #94A3B8; font-size: 12px; margin-top: 16px; line-height: 1.6; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <div style="text-align:center;margin-bottom:20px;color:#fff;">
+      <div style="font-weight:800;font-size:18px;">VAULTIXgusTAR</div>
+      <div style="font-size:12.5px;color:#94A3B8;margin-top:2px;">Shared item — decrypted in your browser</div>
+    </div>
+    <div class="card" id="content">
+      <div style="text-align:center;color:#64748B;font-size:13.5px;">Decrypting…</div>
+    </div>
+    <div class="note">This link works a limited number of times and then stops working permanently. The decryption key was never sent to any server — it only ever existed in the link itself.</div>
+  </div>
+  <script>
+    function b64urlToBytes(s) {
+      s = s.replace(/-/g, '+').replace(/_/g, '/');
+      while (s.length % 4) s += '=';
+      const bin = atob(s);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+    function b64ToBytes(s) {
+      const bin = atob(s);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+    function concatBytes(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0); out.set(b, a.length);
+      return out;
+    }
+
+    (async () => {
+      const el = document.getElementById('content');
+      try {
+        const params = new URLSearchParams(location.hash.slice(1));
+        const id = params.get('id');
+        const keyB64 = params.get('key');
+        if (!id || !keyB64) throw new Error('This link is missing required information.');
+
+        const res = await fetch(`/api/share/${id}`);
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error || 'This link is invalid, expired, or has already been used.');
+
+        const rawKey = b64urlToBytes(keyB64);
+        const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
+        const iv = b64ToBytes(body.iv);
+        const cipherBytes = b64ToBytes(body.ciphertext);
+        const tagBytes = b64ToBytes(body.tag);
+        const combined = concatBytes(cipherBytes, tagBytes); // WebCrypto expects ciphertext+tag concatenated
+
+        const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
+        const data = JSON.parse(new TextDecoder().decode(plainBuf));
+
+        const rows = Object.entries(data.payload || {})
+          .filter(([, v]) => v !== '' && v !== undefined)
+          .map(([k, v]) => `<div class="row"><label>${k}</label><div>${String(v).replace(/</g, '&lt;')}</div></div>`)
+          .join('');
+        el.innerHTML = `<div class="row"><label>Title</label><div>${(data.title || '').replace(/</g, '&lt;')}</div></div>${rows}`;
+      } catch (err) {
+        el.innerHTML = `<div style="text-align:center;color:#DC2626;font-size:13.5px;">${(err.message || 'Something went wrong.').replace(/</g, '&lt;')}</div>`;
+      }
+    })();
+  </script>
+</body>
+</html>
