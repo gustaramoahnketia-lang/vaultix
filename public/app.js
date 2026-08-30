@@ -20,9 +20,12 @@ const state = {
   pinAttempts: 0,
   pinLockedUntil: 0,
   pinBuffer: '',
+  searchOpen: false,
   searchQuery: '',
   searchCategory: 'all',
   searchResults: null,
+  searchLoading: false,
+  recentSearches: [],
   summary: {},
   passwordItems: [],
   noteItems: [],
@@ -112,7 +115,7 @@ async function boot() {
     state.csrfToken = me.csrfToken;
     state.unlocked = me.unlocked;
     state.screen = me.unlocked ? 'app' : (me.user.hasPin ? 'unlock' : 'unlock');
-    if (me.unlocked) { await loadDashboardData(); await loadAvatar(); }
+    if (me.unlocked) { await loadDashboardData(); await loadAvatar(); loadRecentSearches(); }
   } catch {
     state.screen = 'login';
   }
@@ -141,6 +144,20 @@ function resetIdleWatch() {
 }
 ['click', 'keydown', 'mousemove'].forEach((evt) => {
   document.addEventListener(evt, () => { /* server tracks activity per-request; nothing to do client-side */ }, { passive: true });
+});
+
+// Global search shortcut — Ctrl/Cmd+K opens search from any screen, Escape
+// closes it from anywhere (not just while the input itself has focus).
+document.addEventListener('keydown', (e) => {
+  const isShortcut = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k';
+  if (isShortcut && state.screen === 'app' && state.unlocked && !state.duress && !state.modal) {
+    e.preventDefault();
+    if (state.searchOpen) closeSearch(); else openSearch();
+    return;
+  }
+  if (e.key === 'Escape' && state.searchOpen) {
+    closeSearch();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -335,6 +352,7 @@ const FIELD_CONFIGS = {
   document: [['description', 'Description', false, 'text'], ['notes', 'Notes', false, 'textarea']],
 };
 const TYPE_ICON_NAME = {
+  password: 'lock', email: 'mail', personal: 'user', id: 'idcard', note: 'note',
   wifi: 'wifi', contact: 'contact', account: 'account', apikey: 'key', sshkey: 'lock',
   wallet: 'key', physical: 'lock', license: 'idcard', medical: 'activity', inheritance: 'note', document: 'idcard',
 };
@@ -555,6 +573,7 @@ function renderApp() {
             <span class="topbar-title">${TITLES[state.active] || 'Dashboard'}</span>
           </div>
           <div style="display:flex;align-items:center;gap:14px;">
+            ${state.duress ? '' : `<button class="icon-btn" id="topbar-search" title="Search (${isMac() ? '⌘K' : 'Ctrl+K'})">${ICON.search}</button>`}
             <button class="icon-btn" id="topbar-lock" title="Lock Vault">${ICON.lock}</button>
             <div class="avatar">${state.avatarDataUrl ? `<img src="${state.avatarDataUrl}" alt="" />` : (state.user.name || '?').slice(0,1).toUpperCase()}</div>
           </div>
@@ -563,9 +582,11 @@ function renderApp() {
       </div>
       ${state.active !== 'dashboard' && !state.duress ? `<button class="fab" id="fab-add">${ICON.plus}</button>` : ''}
     </div>
+    ${state.searchOpen ? searchOverlay() : ''}
     ${state.modal ? modalHtml() : ''}
   `;
   bindAppEvents();
+  if (state.searchOpen) bindSearchEvents();
 }
 
 function screenHtml() {
@@ -587,6 +608,10 @@ function screenHtml() {
   }
 }
 
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 function timeAgo(ts) {
   const diff = Math.max(0, Date.now() - ts);
   const m = Math.floor(diff / 60000);
@@ -605,73 +630,205 @@ function dashboardScreen() {
   const activityList = state.duress ? DECOY.activity : state.activity;
   return `
     <div style="margin-bottom:20px;">
-      <div style="font-size:20px;font-weight:800;color:var(--navy);">Welcome back, ${(state.user.name || '').split(' ')[0]}</div>
+      <div style="font-size:20px;font-weight:800;color:var(--navy);">Welcome back, ${esc((state.user.name || '').split(' ')[0])}</div>
       <div style="font-size:13px;color:var(--text-muted);margin-top:2px;">Last login ${state.user.lastLogin ? timeAgo(state.user.lastLogin) : '—'}</div>
     </div>
     ${state.duress ? '' : `
-    <div class="search-bar" style="margin-bottom:20px;">
+    <button class="search-trigger" id="open-search">
       <span class="icon">${ICON.search}</span>
-      <input id="global-search" placeholder="Search your vault..." value="${state.searchQuery}" />
-    </div>`}
-    ${state.searchResults ? searchResultsBlock() : `
-      <div class="stat-grid">
-        <div class="card stat-card" data-nav="passwords"><div class="stat-icon">${ICON.password}</div><div class="stat-value">${s.passwords || 0}</div><div class="stat-label">Passwords</div></div>
-        <div class="card stat-card" data-nav="${state.duress ? 'passwords' : 'emails'}"><div class="stat-icon">${ICON.email}</div><div class="stat-value">${s.emails || 0}</div><div class="stat-label">Emails</div></div>
-        <div class="card stat-card" data-nav="${state.duress ? 'notes' : 'personal'}"><div class="stat-icon">${ICON.personal}</div><div class="stat-value">${s.personal || 0}</div><div class="stat-label">Personal</div></div>
-        <div class="card stat-card" data-nav="notes"><div class="stat-icon">${ICON.note}</div><div class="stat-value">${s.notes || 0}</div><div class="stat-label">Secure Notes</div></div>
-      </div>
-      <div class="two-col">
-        <div class="card" style="padding:18px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-            <div style="font-weight:700;color:var(--navy);font-size:14.5px;">Recent Activity</div>
-            ${state.duress ? '' : `<button class="link-btn" data-nav="activity">View all</button>`}
-          </div>
-          ${activityList.slice(0, 4).map((a) => `
-            <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);">
-              <div style="width:8px;height:8px;border-radius:50%;background:var(--success);"></div>
-              <div style="flex:1;font-size:13px;">${a.text}</div>
-              <div style="font-size:11.5px;color:var(--text-muted);">${timeAgo(a.created_at)}</div>
-            </div>`).join('') || '<div style="font-size:13px;color:var(--text-muted);">No activity yet.</div>'}
+      <span class="search-trigger-label">Search your vault…</span>
+      <span class="search-trigger-kbd">${isMac() ? '⌘K' : 'Ctrl K'}</span>
+    </button>`}
+    <div class="stat-grid">
+      <div class="card stat-card" data-nav="passwords"><div class="stat-icon">${ICON.password}</div><div class="stat-value">${s.passwords || 0}</div><div class="stat-label">Passwords</div></div>
+      <div class="card stat-card" data-nav="${state.duress ? 'passwords' : 'emails'}"><div class="stat-icon">${ICON.email}</div><div class="stat-value">${s.emails || 0}</div><div class="stat-label">Emails</div></div>
+      <div class="card stat-card" data-nav="${state.duress ? 'notes' : 'personal'}"><div class="stat-icon">${ICON.personal}</div><div class="stat-value">${s.personal || 0}</div><div class="stat-label">Personal</div></div>
+      <div class="card stat-card" data-nav="notes"><div class="stat-icon">${ICON.note}</div><div class="stat-value">${s.notes || 0}</div><div class="stat-label">Secure Notes</div></div>
+    </div>
+    <div class="two-col">
+      <div class="card" style="padding:18px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <div style="font-weight:700;color:var(--navy);font-size:14.5px;">Recent Activity</div>
+          ${state.duress ? '' : `<button class="link-btn" data-nav="activity">View all</button>`}
         </div>
-        <div class="card" style="padding:18px;">
-          <div style="font-weight:700;color:var(--navy);font-size:14.5px;margin-bottom:12px;">Security Status</div>
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
-            <span style="color:var(--success);display:flex;">${icon('shield', 16)}</span><span style="font-size:13.5px;font-weight:600;">Vault Protected</span>
-          </div>
-          <div style="font-size:12.5px;color:var(--text-muted);line-height:2;">
-            <div>Biometric unlock: <b style="color:${state.user.biometricEnabled ? 'var(--success)' : 'inherit'}">${state.user.biometricEnabled ? 'ON' : 'OFF'}</b></div>
-            <div>Two-factor authentication: <b style="color:${state.user.twoFactorEnabled ? 'var(--success)' : 'var(--warning)'}">${state.user.twoFactorEnabled ? 'ON' : 'OFF'}</b></div>
-            <div>Auto-lock: <b>${autoLockLabel(state.user.autoLockMs)}</b></div>
-          </div>
-          <button class="btn btn-outline btn-block" style="margin-top:12px;" data-nav="${state.duress ? 'passwords' : 'security'}">${state.duress ? 'View All Passwords' : 'Open Security Centre'}</button>
-        </div>
+        ${activityList.slice(0, 4).map((a) => `
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);">
+            <div style="width:8px;height:8px;border-radius:50%;background:var(--success);"></div>
+            <div style="flex:1;font-size:13px;">${esc(a.text)}</div>
+            <div style="font-size:11.5px;color:var(--text-muted);">${timeAgo(a.created_at)}</div>
+          </div>`).join('') || '<div style="font-size:13px;color:var(--text-muted);">No activity yet.</div>'}
       </div>
-      ${state.duress ? '' : `<button class="btn btn-dark" style="margin-top:18px;" id="fab-add">${ICON.plus} Add Information</button>`}
-    `}`;
+      <div class="card" style="padding:18px;">
+        <div style="font-weight:700;color:var(--navy);font-size:14.5px;margin-bottom:12px;">Security Status</div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+          <span style="color:var(--success);display:flex;">${icon('shield', 16)}</span><span style="font-size:13.5px;font-weight:600;">Vault Protected</span>
+        </div>
+        <div style="font-size:12.5px;color:var(--text-muted);line-height:2;">
+          <div>Biometric unlock: <b style="color:${state.user.biometricEnabled ? 'var(--success)' : 'inherit'}">${state.user.biometricEnabled ? 'ON' : 'OFF'}</b></div>
+          <div>Two-factor authentication: <b style="color:${state.user.twoFactorEnabled ? 'var(--success)' : 'var(--warning)'}">${state.user.twoFactorEnabled ? 'ON' : 'OFF'}</b></div>
+          <div>Auto-lock: <b>${autoLockLabel(state.user.autoLockMs)}</b></div>
+        </div>
+        <button class="btn btn-outline btn-block" style="margin-top:12px;" data-nav="${state.duress ? 'passwords' : 'security'}">${state.duress ? 'View All Passwords' : 'Open Security Centre'}</button>
+      </div>
+    </div>
+    ${state.duress ? '' : `<button class="btn btn-dark" style="margin-top:18px;" id="fab-add">${ICON.plus} Add Information</button>`}
+  `;
+}
+
+function isMac() {
+  return /Mac|iPod|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
 }
 
 function autoLockLabel(ms) {
   return { 0: 'Never', 30000: '30 seconds', 60000: '1 minute', 300000: '5 minutes', 900000: '15 minutes' }[ms] || `${ms / 1000}s`;
 }
 
-function searchResultsBlock() {
-  const results = state.searchResults;
-  const cats = ['all', 'password', 'email', 'personal', 'note', 'id', 'wifi', 'contact', 'account'];
-  const catLabel = { all: 'All', password: 'Passwords', email: 'Emails', personal: 'Personal', note: 'Notes', id: 'IDs', wifi: 'Wi-Fi', contact: 'Contacts', account: 'Accounts' };
+// ---------------------------------------------------------------------------
+// Global Search — a command-palette style overlay reachable from any screen
+// (topbar icon or Ctrl/Cmd+K), not just the dashboard. Fixes several real
+// bugs the old dashboard-embedded search box had: it only worked on one
+// screen, its category filter was missing every new item type added since,
+// it left stale results behind when you navigated away and back, it never
+// showed a loading state, and it interpolated the raw search query into
+// HTML unescaped.
+// ---------------------------------------------------------------------------
+const SEARCH_CATS = ['all', ...Object.keys(TYPE_ICON_NAME)];
+
+function searchOverlay() {
+  const q = state.searchQuery;
+  const hasQuery = q.trim().length > 0;
   return `
-    <div style="margin-bottom:12px;">
-      <div style="font-weight:700;color:var(--navy);">Search Results <span style="color:var(--text-muted);font-weight:500;font-size:13px;">— "${state.searchQuery}" · ${results.length} result${results.length === 1 ? '' : 's'}</span></div>
-    </div>
-    <div class="tab-row">${cats.map((c) => `<button class="tab-btn ${state.searchCategory === c ? 'active' : ''}" data-search-cat="${c}">${catLabel[c]}</button>`).join('')}</div>
-    ${results.length === 0 ? `<div class="empty-state"><div class="empty-icon">${ICON.search}</div><div>No matches in your vault yet.</div></div>` : results.map((r) => `
-      <div class="card item-row" data-open-item="${r.id}" style="cursor:pointer;">
-        <div class="item-badge">${ICON[r.type] || icon('lock', 20)}</div>
-        <div class="item-main">
-          <div class="item-title">${r.title}</div>
-          <div class="item-sub">${r.searchUsername || r.category || ''} · Category: ${labelForType(r.type)}</div>
+    <div class="search-scrim" id="search-scrim">
+      <div class="search-panel" role="dialog" aria-label="Search your vault">
+        <div class="search-input-row">
+          <span class="icon">${ICON.search}</span>
+          <input id="search-input" placeholder="Search your vault…" value="${esc(q)}" autocomplete="off" spellcheck="false" />
+          ${hasQuery ? `<button class="icon-btn" id="search-clear" title="Clear">${icon('x', 15)}</button>` : ''}
+          <button class="icon-btn search-close-btn" id="search-close" title="Close">${icon('x', 16)}</button>
         </div>
-        <div style="color:var(--blue);font-size:12.5px;font-weight:700;display:flex;align-items:center;gap:4px;">View Details ${icon('chevronRight',14)}</div>
-      </div>`).join('')}`;
+        ${hasQuery ? `<div class="search-cat-row">${SEARCH_CATS.map((c) => `<button class="chip ${state.searchCategory === c ? 'active' : ''}" data-search-cat="${c}">${c === 'all' ? 'All' : labelForType(c)}</button>`).join('')}</div>` : ''}
+        <div class="search-results">${searchBody()}</div>
+      </div>
+    </div>`;
+}
+
+function searchBody() {
+  const q = state.searchQuery.trim();
+  if (!q) {
+    if (state.recentSearches.length === 0) {
+      return `<div class="search-empty">
+        <div class="empty-icon">${ICON.search}</div>
+        <div>Search across every category in your vault — passwords, notes, API keys, documents, and more.</div>
+      </div>`;
+    }
+    return `
+      <div class="search-recent-head">
+        <span>Recent Searches</span>
+        <button class="link-btn" id="search-clear-history">Clear</button>
+      </div>
+      ${state.recentSearches.map((term) => `<button class="search-recent-item" data-recent="${esc(term)}">${ICON.activity}<span>${esc(term)}</span></button>`).join('')}`;
+  }
+  if (state.searchLoading) {
+    return `<div class="search-empty"><div class="search-spinner"></div><div>Searching…</div></div>`;
+  }
+  const results = state.searchResults || [];
+  if (results.length === 0) {
+    return `<div class="search-empty"><div class="empty-icon">${ICON.search}</div><div>No matches for "${esc(q)}" in your vault.</div></div>`;
+  }
+  return `
+    <div class="search-result-count">${results.length} result${results.length === 1 ? '' : 's'}</div>
+    ${results.map((r) => `
+      <button class="search-result-row" data-open-item="${r.id}">
+        <div class="item-badge">${icon(TYPE_ICON_NAME[r.type] || 'note', 18)}</div>
+        <div class="item-main">
+          <div class="item-title">${esc(r.title)}</div>
+          <div class="item-sub">${labelForType(r.type)}${r.searchUsername ? ` · ${esc(r.searchUsername)}` : ''}</div>
+        </div>
+        ${icon('chevronRight', 15)}
+      </button>`).join('')}`;
+}
+
+function openSearch() {
+  state.searchOpen = true;
+  render();
+  setTimeout(() => document.getElementById('search-input')?.focus(), 20);
+}
+
+function closeSearch() {
+  state.searchOpen = false;
+  state.searchResults = null;
+  state.searchQuery = '';
+  state.searchCategory = 'all';
+  render();
+}
+
+const RECENT_SEARCHES_KEY = () => `vx_recent_searches_${state.user?.id || 'anon'}`;
+function loadRecentSearches() {
+  try { state.recentSearches = JSON.parse(localStorage.getItem(RECENT_SEARCHES_KEY()) || '[]'); }
+  catch { state.recentSearches = []; }
+}
+function saveRecentSearch(term) {
+  const trimmed = term.trim();
+  if (!trimmed) return;
+  state.recentSearches = [trimmed, ...state.recentSearches.filter((t) => t.toLowerCase() !== trimmed.toLowerCase())].slice(0, 6);
+  try { localStorage.setItem(RECENT_SEARCHES_KEY(), JSON.stringify(state.recentSearches)); } catch { /* storage unavailable — non-fatal */ }
+}
+function clearRecentSearches() {
+  state.recentSearches = [];
+  try { localStorage.removeItem(RECENT_SEARCHES_KEY()); } catch { /* non-fatal */ }
+}
+
+function bindSearchEvents() {
+  const scrim = document.getElementById('search-scrim');
+  if (scrim) scrim.onclick = (e) => { if (e.target === scrim) closeSearch(); };
+  const closeBtn = document.getElementById('search-close');
+  if (closeBtn) closeBtn.onclick = closeSearch;
+  const clearBtn = document.getElementById('search-clear');
+  if (clearBtn) clearBtn.onclick = () => { state.searchQuery = ''; state.searchResults = null; renderPreservingSearchFocus(); };
+
+  const input = document.getElementById('search-input');
+  if (input) {
+    let t;
+    input.oninput = () => {
+      clearTimeout(t);
+      state.searchQuery = input.value;
+      t = setTimeout(runSearch, 250);
+    };
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') { clearTimeout(t); runSearch(); }
+      if (e.key === 'Escape') { closeSearch(); }
+    };
+  }
+
+  root.querySelectorAll('[data-search-cat]').forEach((btn) => {
+    btn.onclick = () => { state.searchCategory = btn.dataset.searchCat; runSearch(); };
+  });
+  root.querySelectorAll('[data-recent]').forEach((btn) => {
+    btn.onclick = () => { state.searchQuery = btn.dataset.recent; runSearch(); };
+  });
+  const clearHistoryBtn = document.getElementById('search-clear-history');
+  if (clearHistoryBtn) clearHistoryBtn.onclick = () => { clearRecentSearches(); render(); };
+
+  bindSearchResultEvents();
+}
+
+function bindSearchResultEvents() {
+  // Scoped to the search panel only — the overlay sits on top of whatever
+  // screen is underneath, and that screen may have its own [data-open-item]
+  // elements (e.g. Documents) with their own handlers that must not be
+  // overwritten by this one.
+  const panel = document.querySelector('.search-panel');
+  if (!panel) return;
+  panel.querySelectorAll('[data-open-item]').forEach((el) => {
+    el.onclick = async () => {
+      try {
+        const res = await api('GET', `/api/vault/items/${el.dataset.openItem}`);
+        closeSearch();
+        state.modal = { type: 'item-detail', item: res.item };
+        render();
+      } catch (err) { toast(err.message, 'error'); }
+    };
+  });
 }
 
 function labelForType(t) {
@@ -1221,7 +1378,7 @@ function bindAuthEvents() {
       state.user = res.user; state.csrfToken = res.csrfToken; state.unlocked = true; state.screen = 'app';
       state.loginAttempts = 0;
       await loadDashboardData();
-      await loadAvatar();
+      await loadAvatar(); loadRecentSearches();
       resetIdleWatch();
       render();
     } catch (err) {
@@ -1294,7 +1451,7 @@ function bindAuthEvents() {
   if (continueBtn) continueBtn.onclick = async () => {
     state.screen = 'app'; state.active = 'dashboard';
     await loadDashboardData();
-    await loadAvatar();
+    await loadAvatar(); loadRecentSearches();
     resetIdleWatch();
     render();
   };
@@ -1397,7 +1554,7 @@ async function tryBiometricUnlock() {
 async function afterUnlock() {
   state.unlocked = true; state.duress = false; state.screen = 'app';
   await loadDashboardData();
-  await loadAvatar();
+  await loadAvatar(); loadRecentSearches();
   resetIdleWatch();
   render();
 }
@@ -1423,6 +1580,8 @@ function bindAppEvents() {
 
   const doLock = async () => { try { await api('POST', '/api/auth/lock', {}); } catch {} state.unlocked = false; state.duress = false; state.screen = 'unlock'; state.modal = null; toast('Vault locked'); render(); };
   ['lock-vault-btn', 'topbar-lock', 'lock-vault-btn-2'].forEach((id) => { const el = document.getElementById(id); if (el) el.onclick = doLock; });
+  const topbarSearch = document.getElementById('topbar-search');
+  if (topbarSearch) topbarSearch.onclick = openSearch;
 
   bindModalEvents();
   bindDashboardEvents();
@@ -1436,39 +1595,48 @@ function bindAppEvents() {
 }
 
 function bindDashboardEvents() {
-  const search = document.getElementById('global-search');
-  if (search) {
-    let t;
-    search.oninput = () => {
-      clearTimeout(t);
-      state.searchQuery = search.value;
-      t = setTimeout(runSearch, 250);
-    };
-    search.onkeydown = (e) => { if (e.key === 'Enter') { clearTimeout(t); runSearch(); } };
-  }
-  root.querySelectorAll('[data-search-cat]').forEach((btn) => {
-    btn.onclick = () => { state.searchCategory = btn.dataset.searchCat; runSearch(); };
-  });
-  root.querySelectorAll('[data-open-item]').forEach((el) => {
-    el.onclick = async () => {
-      try {
-        const res = await api('GET', `/api/vault/items/${el.dataset.openItem}`);
-        state.modal = { type: 'item-detail', item: res.item };
-        render();
-      } catch (err) { toast(err.message, 'error'); }
-    };
-  });
+  const openBtn = document.getElementById('open-search');
+  if (openBtn) openBtn.onclick = openSearch;
 }
 
+let searchRequestSeq = 0;
 async function runSearch() {
-  if (!state.searchQuery.trim()) { state.searchResults = null; render(); return; }
+  const q = state.searchQuery.trim();
+  if (!q) { state.searchResults = null; state.searchLoading = false; renderPreservingSearchFocus(); return; }
+  const mySeq = ++searchRequestSeq;
+  state.searchLoading = true;
+  renderPreservingSearchFocus();
   try {
     const cat = state.searchCategory === 'all' ? '' : `&category=${encodeURIComponent(state.searchCategory)}`;
-    const res = await api('GET', `/api/search?q=${encodeURIComponent(state.searchQuery)}${cat}`);
+    const res = await api('GET', `/api/search?q=${encodeURIComponent(q)}${cat}`);
+    if (mySeq !== searchRequestSeq) return; // a newer keystroke's request already superseded this one
     state.searchResults = res.results;
-    render();
-    document.getElementById('global-search')?.focus();
-  } catch (err) { toast(err.message, 'error'); }
+    state.searchLoading = false;
+    saveRecentSearch(q);
+    renderPreservingSearchFocus();
+  } catch (err) {
+    if (mySeq !== searchRequestSeq) return;
+    state.searchLoading = false;
+    toast(err.message, 'error');
+    renderPreservingSearchFocus();
+  }
+}
+
+// A full render() rebuilds the search input from scratch, which would
+// otherwise steal focus and reset the cursor to the end on every debounced
+// keystroke. This captures and restores both across the rebuild.
+function renderPreservingSearchFocus() {
+  const input = document.getElementById('search-input');
+  const wasFocused = document.activeElement === input;
+  const caret = input ? input.selectionStart : null;
+  render();
+  if (wasFocused) {
+    const next = document.getElementById('search-input');
+    if (next) {
+      next.focus();
+      if (caret !== null) next.setSelectionRange(caret, caret);
+    }
+  }
 }
 
 function bindPasswordsEvents() {
