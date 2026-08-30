@@ -123,6 +123,37 @@ async function boot() {
 }
 boot();
 
+// ---------------------------------------------------------------------------
+// Installability — makes the app launch from a home-screen/desktop icon
+// instead of a typed-in URL. Registering the service worker is what lets
+// Chrome/Edge offer their native "Install app" prompt; capturing
+// beforeinstallprompt lets Settings → About trigger that same prompt from
+// an in-app button instead of waiting for the browser's own UI.
+// ---------------------------------------------------------------------------
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => { /* non-fatal — app still works without it */ });
+  });
+}
+
+let deferredInstallPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  if (state.screen === 'app') render(); // reveal the Install button in Settings if it's open
+});
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  toast('VAULTIXgusTAR installed');
+});
+
+function isIOS() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+}
+function isStandalone() {
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
 let idleTimer = null;
 function resetIdleWatch() {
   if (idleTimer) clearInterval(idleTimer);
@@ -404,7 +435,7 @@ function renderAuthShell(innerHtml) {
     <div class="auth-shell">
       <div class="auth-box">
         <div class="auth-brand">
-          <div class="auth-logo">${icon('shield', 28)}</div>
+          <div class="auth-logo"><img src="/brand/icon-256.png" alt="" /></div>
           <h1>${APP_NAME}</h1>
           <p>Your private world, securely stored.</p>
         </div>
@@ -560,7 +591,7 @@ function renderApp() {
     <div class="app-shell">
       ${state.mobileOpen ? '<div class="scrim" id="scrim"></div>' : ''}
       <div class="sidebar ${state.mobileOpen ? 'open' : ''}">
-        <div class="sidebar-brand"><div class="mark">${icon('shield', 18)}</div><div class="name">${APP_NAME}</div></div>
+        <div class="sidebar-brand"><div class="mark"><img src="/brand/icon-256.png" alt="" /></div><div class="name">${APP_NAME}</div></div>
         <div class="nav-list">
           ${navItems.map(([key, label, ic]) => `<button class="nav-item ${state.active === key ? 'active' : ''}" data-nav="${key}">${ic} ${label}</button>`).join('')}
         </div>
@@ -1163,13 +1194,40 @@ function settingsScreen() {
     body = `<div class="card" style="padding:20px;max-width:480px;">
       <div style="font-weight:800;color:var(--navy);margin-bottom:6px;">${APP_NAME}</div>
       <div style="font-size:13px;color:var(--text-muted);line-height:1.7;margin-bottom:16px;">A secure personal information vault: password manager, encrypted notes, universal search, and a Security Centre — backed by a real Node.js API, SQLite database, scrypt-hashed authentication, and AES-256-GCM encrypted storage.</div>
-      <div style="border-top:1px solid var(--border);padding-top:14px;">
+      ${installSectionHtml()}
+      <div style="border-top:1px solid var(--border);padding-top:14px;margin-top:16px;">
         <button class="link-btn" id="logout-btn" style="display:block;margin-bottom:12px;color:var(--text);">Sign Out</button>
         <button class="link-btn" id="open-delete-account" style="color:var(--danger);font-weight:700;">Delete Account</button>
       </div>
     </div>`;
   }
   return `<div class="tab-row">${tabs.map((t) => `<button class="tab-btn ${tab === t ? 'active' : ''}" data-settings-tab="${t}">${t[0].toUpperCase()}${t.slice(1)}</button>`).join('')}</div>${body}`;
+}
+
+function installSectionHtml() {
+  if (isStandalone()) {
+    return `<div class="rec-tip success" style="margin-bottom:0;">${ICON.check} Already installed — you're running the installed app.</div>`;
+  }
+  if (deferredInstallPrompt) {
+    return `
+      <div style="border-top:1px solid var(--border);padding-top:16px;">
+        <div style="font-weight:700;color:var(--navy);font-size:14px;margin-bottom:6px;">Install App</div>
+        <div class="field-hint" style="margin-bottom:12px;">Add ${APP_NAME} to your home screen or desktop so it opens straight to the vault — no address bar, no typing a link.</div>
+        <button class="btn btn-outline btn-block" id="install-app-btn">${icon('plus', 15)} Install ${APP_NAME}</button>
+      </div>`;
+  }
+  if (isIOS()) {
+    return `
+      <div style="border-top:1px solid var(--border);padding-top:16px;">
+        <div style="font-weight:700;color:var(--navy);font-size:14px;margin-bottom:6px;">Install App</div>
+        <div class="field-hint">iOS doesn't allow apps to trigger this automatically. In Safari, tap the Share icon, then "Add to Home Screen".</div>
+      </div>`;
+  }
+  return `
+    <div style="border-top:1px solid var(--border);padding-top:16px;">
+      <div style="font-weight:700;color:var(--navy);font-size:14px;margin-bottom:6px;">Install App</div>
+      <div class="field-hint">Look for an install icon in your browser's address bar, or check its menu for "Install ${APP_NAME}" / "Add to Home Screen".</div>
+    </div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1850,6 +1908,15 @@ function bindSettingsEvents() {
   if (logoutBtn) logoutBtn.onclick = async () => { try { await api('POST', '/api/auth/logout', {}); } catch {} resetToLogin(); };
   const openDelete = document.getElementById('open-delete-account');
   if (openDelete) openDelete.onclick = () => { state.modal = { type: 'delete-account' }; render(); };
+
+  const installBtn = document.getElementById('install-app-btn');
+  if (installBtn) installBtn.onclick = async () => {
+    if (!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    const { outcome } = await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    if (outcome === 'accepted') toast('Installing…'); else render();
+  };
 
   const openDuress = document.getElementById('open-duress-pin');
   if (openDuress) openDuress.onclick = () => { state.modal = { type: 'duress-pin' }; render(); };

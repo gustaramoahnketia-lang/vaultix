@@ -317,7 +317,32 @@ reality.
 
 ---
 
-## 10. Production hardening checklist (not done here, on purpose)
+## 10. Installing the app (no typed URL required)
+
+The app is an installable Progressive Web App: `public/manifest.json` and
+`public/sw.js` are enough for Chrome/Edge/Android to offer a native
+"Install app" prompt, and for iOS Safari to support "Add to Home Screen".
+Once installed, it opens from its own icon in a standalone window — no
+address bar, no re-typing a URL.
+
+- **In-app button:** Settings → About shows an "Install VAULTIXgusTAR"
+  button once the browser's `beforeinstallprompt` event has fired (see
+  `public/app.js`, the `beforeinstallprompt`/`installBtn` handling).
+- **iOS:** Apple doesn't support that automatic prompt — Settings → About
+  shows manual instructions instead (Share icon → "Add to Home Screen").
+- **Requires HTTPS.** Service workers (and therefore installability) are
+  blocked by every browser on plain HTTP except `localhost`. This is the
+  same HTTPS requirement section 11 already calls out for cookies — one
+  more reason it's not optional once this leaves your own machine.
+- **What the service worker does and doesn't do:** it caches the static
+  app shell (`index.html`, `app.js`, `styles.css`, icons) for instant
+  repeat loads, and deliberately passes every `/api/*` request straight to
+  the network, uncached — see the comment at the top of `public/sw.js` for
+  why caching authenticated responses isn't a trade-off worth making here.
+
+---
+
+## 11. Production hardening checklist (not done here, on purpose)
 
 This app runs over plain HTTP on localhost, which is fine for development
 and grading but not for real users. Before deploying:
@@ -325,7 +350,8 @@ and grading but not for real users. Before deploying:
 - [ ] Put it behind HTTPS (reverse proxy like Caddy/nginx, or a platform
       that terminates TLS for you) — cookies are marked `Secure`, so they
       **will not be sent at all** over plain HTTP in a real browser once
-      you're not on `localhost`.
+      you're not on `localhost`, and the PWA install feature above requires
+      it too.
 - [ ] Set `VAULTIX_KEY_PEPPER` to a real secret from a secrets manager.
 - [ ] Add HSTS, and tighten the `Content-Security-Policy` in
       `server/http-utils.js` for your actual asset origins.
@@ -341,7 +367,7 @@ and grading but not for real users. Before deploying:
 
 ---
 
-## 11. API reference (summary)
+## 12. API reference (summary)
 
 All endpoints are JSON. Mutating endpoints (`POST`/`PUT`/`DELETE`) require
 the `x-csrf-token` header described in section 5.
@@ -404,7 +430,7 @@ POST   /api/recovery/reset             { email, code, recoveryKey, newPassword }
 
 ---
 
-## 12. Project structure
+## 13. Project structure
 
 ```
 vaultix/
@@ -420,6 +446,8 @@ vaultix/
   public/
     index.html, app.js, styles.css   vanilla-JS SPA, no build step, no framework
     share.html                       standalone recipient page for self-destructing share links
+    manifest.json, sw.js             PWA installability -- see section 10
+    brand/                           app icon set generated from the source logo
   tests/
     helpers.js, auth.test.js, isolation.test.js, vault.test.js, security.test.js, expansion.test.js
   .env.example
