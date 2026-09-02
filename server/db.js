@@ -146,6 +146,36 @@ CREATE TABLE IF NOT EXISTS shares (
   created_at INTEGER NOT NULL
 );
 
+-- Calendar / reminders (spec section 19+). Deliberately stored in plaintext
+-- columns, not AES-256-GCM encrypted like vault_items' secrets — the same
+-- pattern vault_items already uses for its own title/category/searchUsername
+-- metadata, and for the same reason: the calendar needs to list/sort/filter
+-- by date without decrypting every row on every dashboard load. Ownership
+-- (user_id) is still enforced on every query exactly like everywhere else in
+-- this file. If an event is linked to a vault entry (linked_item_id), the
+-- entry's own encrypted secrets are still only reachable through the normal
+-- unlock-gated vault item endpoints — linking never exposes vault contents
+-- through the calendar.
+CREATE TABLE IF NOT EXISTS events (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  event_type TEXT NOT NULL DEFAULT 'general', -- birthday | expiry | medication | water | general
+  start_date TEXT NOT NULL,   -- 'YYYY-MM-DD'
+  start_time TEXT,            -- 'HH:MM', optional
+  end_time TEXT,
+  location TEXT,
+  description TEXT,
+  category TEXT,
+  recurrence TEXT NOT NULL DEFAULT 'none', -- none | daily | weekly | monthly | annually
+  reminders TEXT NOT NULL DEFAULT '[]',    -- JSON: [{daysBefore, time}]
+  linked_item_id TEXT REFERENCES vault_items(id) ON DELETE SET NULL,
+  notify_enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_user_date ON events(user_id, start_date);
+
 CREATE TABLE IF NOT EXISTS security_events (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -160,5 +190,5 @@ CREATE INDEX IF NOT EXISTS idx_events_user ON security_events(user_id, created_a
 db.exec(SCHEMA);
 
 export function resetDatabaseForTests() {
-  db.exec('DELETE FROM shares; DELETE FROM vault_files; DELETE FROM security_events; DELETE FROM vault_items; DELETE FROM sessions; DELETE FROM users;');
+  db.exec('DELETE FROM shares; DELETE FROM events; DELETE FROM vault_files; DELETE FROM security_events; DELETE FROM vault_items; DELETE FROM sessions; DELETE FROM users;');
 }

@@ -43,7 +43,7 @@ test('dashboard summary counts reflect created items by type', async () => {
   assert.ok(summary.body.summary.personal >= 1);
 });
 
-test('search only matches title/category/username metadata, is scoped to the caller, and supports category filters', async () => {
+test('search matches title/category/username metadata (in addition to field content, tested separately), is scoped to the caller, and supports category filters', async () => {
   await user.post('/api/vault/items', { type: 'password', title: 'Facebook', category: 'Social', searchUsername: 'example@gmail.com', payload: { password: 'F4ceB00k!Secure' } });
   await user.post('/api/vault/items', { type: 'password', title: 'Instagram', category: 'Social', searchUsername: 'gustar123', payload: { password: '1nsta_Gr4mSafe' } });
 

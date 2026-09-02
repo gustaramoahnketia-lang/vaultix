@@ -25,6 +25,7 @@ const ALLOWED_TYPES = [
   'medical',     // blood type, conditions, medications, emergency contacts
   'inheritance', // digital-estate / "in case of emergency" instructions
   'document',    // metadata for an attached encrypted file — see vault_files
+  'custom',      // fully user-defined field names/values — payload: { fields: [{name,value,sensitive}], notes }
 ];
 
 function encryptPayload(payload, vek) {
@@ -118,6 +119,7 @@ export function summary(userId) {
     medical: counts.medical || 0,
     inheritance: counts.inheritance || 0,
     documents: counts.document || 0,
+    custom: counts.custom || 0,
   };
 }
 
@@ -127,25 +129,166 @@ export function summary(userId) {
  * never against decrypted secret payloads. See README "Search architecture"
  * for why the encrypted content itself is not searched.
  */
-export function searchItems(userId, { q = '', category } = {}) {
-  const term = `%${q.trim().toLowerCase()}%`;
-  let rows;
-  if (category && category !== 'all') {
-    rows = db.prepare(`
-      SELECT * FROM vault_items
-      WHERE user_id = ? AND type = ?
-        AND (LOWER(title) LIKE ? OR LOWER(COALESCE(search_username,'')) LIKE ? OR LOWER(COALESCE(category,'')) LIKE ?)
-      ORDER BY updated_at DESC LIMIT 50
-    `).all(userId, category, term, term, term);
-  } else {
-    rows = db.prepare(`
-      SELECT * FROM vault_items
-      WHERE user_id = ?
-        AND (LOWER(title) LIKE ? OR LOWER(COALESCE(search_username,'')) LIKE ? OR LOWER(COALESCE(category,'')) LIKE ?)
-      ORDER BY updated_at DESC LIMIT 50
-    `).all(userId, term, term, term);
+// Field names treated as sensitive by default (mirrors the client's
+// SENSITIVE_KEYS in public/app.js) — their VALUES are never included in a
+// search-result preview, even though the field still counts as a match.
+// A custom field can also mark itself sensitive explicitly (see
+// flattenFields below) regardless of its name.
+const SENSITIVE_FIELD_NAMES = new Set([
+  'password', 'secretkey', 'privatekey', 'seedphrase', 'passphrase', 'code',
+  'policynumber', 'licensekey', 'exchangeapikey',
+]);
+
+// Built-in item types store abbreviated JSON keys ('dob', 'fullName') but
+// users search by the human-readable label they actually see on screen
+// ("Date of Birth", "Full Name") — mirrors the field labels in
+// public/app.js's PERSONAL_FIELDS / FIELD_CONFIGS. Without this map,
+// searching the exact phrase "Date of Birth" would fail to match a field
+// whose JSON key is just "dob", even though the value search would still
+// work. A 'custom' item's field name IS already the user's own label, so
+// this map only matters for the fixed built-in types.
+const FIELD_LABELS = {
+  fullname: 'Full Name', dob: 'Date of Birth', phone: 'Phone Number', email: 'Email',
+  address: 'Address', occupation: 'Occupation', emergencycontact: 'Emergency Contact',
+  network: 'Network Name', password: 'Password', notes: 'Notes', website: 'Website',
+  username: 'Username', service: 'Service', keyid: 'Key ID / Access Key', secretkey: 'Secret Key',
+  environment: 'Environment', host: 'Host', port: 'Port', privatekey: 'Private Key',
+  passphrase: 'Passphrase', seedphrase: 'Seed Phrase', exchangeapikey: 'Exchange API Key',
+  location: 'Location', code: 'Code / PIN', software: 'Software', licensekey: 'License Key',
+  edition: 'Edition', bloodtype: 'Blood Type', conditions: 'Conditions', medications: 'Medications',
+  allergies: 'Allergies', emergencydoctor: 'Emergency Doctor', doctorphone: 'Doctor Phone',
+  insuranceprovider: 'Insurance Provider', policynumber: 'Policy Number', instructions: 'Instructions',
+  description: 'Description',
+};
+
+/** Turns any item payload into a flat list of {name, label, value, sensitive} to search over. */
+// Custom fields let the user mark sensitivity themselves, but that's not
+// trusted as the ONLY safeguard — a field a user names "Password" or "PIN"
+// is treated as sensitive regardless of whether they remembered to check
+// the box. This is a floor, not a ceiling: it can only turn sensitivity ON
+// (defense in depth), never override an explicit `sensitive: true` back to
+// false.
+const AUTO_SENSITIVE_NAME_RE = /password|passphrase|\bpin\b|\bcvv\b|\bssn\b|secret|private\s*key|seed\s*phrase|license\s*key/i;
+
+function flattenFields(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+  if (Array.isArray(payload.fields)) {
+    // 'custom' type: the user's own field name already IS the label they'd search for.
+    const out = payload.fields
+      .filter((f) => f && (f.name || f.value))
+      .map((f) => ({
+        name: String(f.name || ''), label: String(f.name || ''), value: String(f.value ?? ''),
+        sensitive: !!f.sensitive || AUTO_SENSITIVE_NAME_RE.test(String(f.name || '')),
+      }));
+    if (payload.notes) out.push({ name: 'notes', label: 'Notes', value: String(payload.notes), sensitive: false });
+    return out;
   }
-  return rows.map(rowToSummary);
+  return Object.entries(payload)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => ({
+      name: k,
+      label: FIELD_LABELS[k.toLowerCase()] || k,
+      value: String(v),
+      sensitive: SENSITIVE_FIELD_NAMES.has(k.toLowerCase()) || AUTO_SENSITIVE_NAME_RE.test(k),
+    }));
+}
+
+function normalize(s) {
+  // Case-insensitive, and tolerant of the punctuation/whitespace variation
+  // real user queries have — "15/05/2000" vs "15-05-2000", "Date of Birth"
+  // vs "date-of-birth", extra spaces, etc.
+  return String(s ?? '').toLowerCase().trim().replace(/\s+/g, ' ');
+}
+function normalizeLoose(s) {
+  return normalize(s).replace(/[\s\-_/.,]+/g, '');
+}
+
+/**
+ * Real vault-wide content search. Requires the caller's own unlocked VEK —
+ * this decrypts each of THIS USER's OWN items (never another user's; the
+ * SQL below is scoped by user_id exactly like every other query in this
+ * file) to search field names and values, not just the title. That's a
+ * deliberate trade-off documented in README "Search architecture v2": for a
+ * personal vault's scale (tens to low hundreds of items), decrypting the
+ * caller's own records on every search is cheap and correct; it is not the
+ * same as building a searchable index of ciphertext, and it never touches
+ * any other user's data.
+ *
+ * Sensitive field values (passwords, PINs, private keys, etc.) are matched
+ * against but their VALUE is never included in the response — only that a
+ * sensitive field matched, per spec section 11 ("do not expose sensitive
+ * password/PIN values directly in search-result previews").
+ */
+export function searchItems(userId, vek, { q = '', category } = {}) {
+  const queryNorm = normalize(q);
+  const queryLoose = normalizeLoose(q);
+  if (!queryNorm) return [];
+
+  const rows = category && category !== 'all'
+    ? db.prepare('SELECT * FROM vault_items WHERE user_id = ? AND type = ? ORDER BY updated_at DESC LIMIT 500').all(userId, category)
+    : db.prepare('SELECT * FROM vault_items WHERE user_id = ? ORDER BY updated_at DESC LIMIT 500').all(userId);
+
+  const results = [];
+  for (const row of rows) {
+    const titleNorm = normalize(row.title);
+    const catNorm = normalize(row.category);
+    const userNorm = normalize(row.search_username);
+
+    // Rank 0: title/heading — the most important match, per spec section 2.
+    if (titleNorm.includes(queryNorm) || normalizeLoose(row.title).includes(queryLoose)) {
+      results.push({ ...rowToSummary(row), rank: 0, matchedIn: 'heading', matchedField: null, matchedExcerpt: null });
+      continue;
+    }
+    if (userNorm && userNorm.includes(queryNorm)) {
+      results.push({ ...rowToSummary(row), rank: 1, matchedIn: 'field', matchedField: 'Username/Email', matchedExcerpt: row.search_username });
+      continue;
+    }
+    if (catNorm && catNorm.includes(queryNorm)) {
+      results.push({ ...rowToSummary(row), rank: 4, matchedIn: 'category', matchedField: 'Category', matchedExcerpt: row.category });
+      continue;
+    }
+
+    // Rank 2/3: decrypt and scan actual field names + values. This is the
+    // fix for the core bug — "Date of Birth: 15/05/2000" is now findable by
+    // searching "birth", "date of birth", or "15/05/2000".
+    let payload;
+    try {
+      payload = decryptJSON({ ciphertext: row.payload_ciphertext, iv: row.payload_iv, tag: row.payload_tag }, vek);
+    } catch { continue; } // tampered/corrupt row — exclude rather than crash the whole search
+    const fields = flattenFields(payload);
+
+    let matched = null;
+    for (const f of fields) {
+      const nameNorm = normalize(f.name);
+      const labelNorm = normalize(f.label);
+      const valueNorm = normalize(f.value);
+      const valueLoose = normalizeLoose(f.value);
+      if (nameNorm.includes(queryNorm) || labelNorm.includes(queryNorm)) {
+        matched = { rank: 3, matchedIn: 'field-name', matchedField: f.label, sensitive: f.sensitive, excerpt: f.sensitive ? null : f.value };
+        break;
+      }
+      if (valueNorm.includes(queryNorm) || (queryLoose.length >= 3 && valueLoose.includes(queryLoose))) {
+        matched = { rank: 2, matchedIn: 'field-value', matchedField: f.label, sensitive: f.sensitive, excerpt: f.sensitive ? null : f.value };
+        break;
+      }
+    }
+    if (matched) {
+      results.push({
+        ...rowToSummary(row), rank: matched.rank, matchedIn: matched.matchedIn,
+        matchedField: matched.matchedField,
+        matchedExcerpt: matched.sensitive ? null : truncate(matched.excerpt, 80),
+        matchedSensitive: matched.sensitive,
+      });
+    }
+  }
+
+  results.sort((a, b) => a.rank - b.rank || b.updatedAt - a.updatedAt);
+  return results.slice(0, 50);
+}
+
+function truncate(s, n) {
+  if (!s) return s;
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
 }
 
 export function hasDuplicatePasswords(userId, vek) {

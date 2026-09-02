@@ -14,6 +14,7 @@ import {
 } from './auth.js';
 import { cacheVek, getVek, dropVek, issueRecoveryCode, checkRecoveryCode, consumeRecoveryCode, ipRateLimited } from './store.js';
 import * as Vault from './vault.js';
+import * as Events from './events.js';
 import { Router, httpErr, sendJson } from './http-utils.js';
 
 export const router = new Router();
@@ -350,12 +351,61 @@ router.delete('/api/vault/items/:id', authGuard, csrfGuard, async (req, res) => 
   sendJson(res, 200, { ok: true });
 });
 
-router.get('/api/search', authGuard, async (req, res) => {
+router.get('/api/search', authGuard, unlockGuard, async (req, res) => {
   const url = new URL(req.url, 'http://internal');
   const q = url.searchParams.get('q') || '';
   const category = url.searchParams.get('category') || undefined;
-  const results = Vault.searchItems(req.user.id, { q, category });
-  sendJson(res, 200, { results, count: results.length });
+  const results = Vault.searchItems(req.user.id, req.vek, { q, category });
+  // Spec section 30: the main search also searches the calendar — "John" ->
+  // vault entry AND John's birthday reminder. Events are a distinct result
+  // shape (no payload/reveal semantics) so they're returned in their own
+  // array rather than merged into vault item results.
+  const events = (!category || category === 'all' || category === 'event') ? Events.searchEvents(req.user.id, q) : [];
+  sendJson(res, 200, { results, events, count: results.length + events.length });
+});
+
+// ---------------------------------------------------------------------------
+// Calendar / events (spec section 19+)
+// ---------------------------------------------------------------------------
+router.get('/api/events', authGuard, async (req, res) => {
+  const url = new URL(req.url, 'http://internal');
+  const from = url.searchParams.get('from');
+  const to = url.searchParams.get('to');
+  if (!from || !to) throw httpErr(400, 'from and to date parameters are required.');
+  sendJson(res, 200, { events: Events.listEventsInRange(req.user.id, from, to) });
+});
+
+router.get('/api/events/upcoming', authGuard, async (req, res) => {
+  const url = new URL(req.url, 'http://internal');
+  const days = Math.min(365, Math.max(1, Number(url.searchParams.get('days')) || 60));
+  sendJson(res, 200, { events: Events.upcomingEvents(req.user.id, days) });
+});
+
+router.get('/api/events/today', authGuard, async (req, res) => {
+  sendJson(res, 200, { events: Events.todayEvents(req.user.id) });
+});
+
+router.post('/api/events', authGuard, csrfGuard, async (req, res) => {
+  const event = Events.createEvent(req.user.id, req.body);
+  logEvent(req.user.id, `Reminder created: ${event.title}`);
+  sendJson(res, 201, { event });
+});
+
+router.get('/api/events/:id', authGuard, async (req, res) => {
+  sendJson(res, 200, { event: Events.getEvent(req.user.id, req.params.id) });
+});
+
+router.put('/api/events/:id', authGuard, csrfGuard, async (req, res) => {
+  const event = Events.updateEvent(req.user.id, req.params.id, req.body);
+  logEvent(req.user.id, `Reminder updated: ${event.title}`);
+  sendJson(res, 200, { event });
+});
+
+router.delete('/api/events/:id', authGuard, csrfGuard, async (req, res) => {
+  const existing = Events.getEvent(req.user.id, req.params.id);
+  Events.deleteEvent(req.user.id, req.params.id);
+  logEvent(req.user.id, `Reminder deleted: ${existing.title}`);
+  sendJson(res, 200, { ok: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -554,7 +604,7 @@ function labelFor(type) {
     note: 'Secure note', wifi: 'Wi-Fi credential', contact: 'Contact', account: 'Account',
     apikey: 'API key', sshkey: 'SSH key', wallet: 'Crypto wallet', physical: 'Physical access code',
     license: 'Software license', medical: 'Medical profile', inheritance: 'Digital inheritance note',
-    document: 'Document',
+    document: 'Document', custom: 'Custom item',
   }[type] || 'Item';
 }
 

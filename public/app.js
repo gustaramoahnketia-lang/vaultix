@@ -24,18 +24,23 @@ const state = {
   searchQuery: '',
   searchCategory: 'all',
   searchResults: null,
+  searchEventResults: null,
   searchLoading: false,
   recentSearches: [],
   summary: {},
   passwordItems: [],
   noteItems: [],
   personalItem: null,
+  customItems: [],
   developerItems: [],
   documentItems: [],
   physicalItems: [],
   medicalItems: [],
   developerTab: 'apikey',
   physicalTab: 'physical',
+  events: [],
+  calendarView: 'month', // 'month' | 'upcoming'
+  calendarCursor: null, // {year, month} — set on first load
   activity: [],
   chainStatus: null,
   health: null,
@@ -154,6 +159,60 @@ function isStandalone() {
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
 }
 
+// ---------------------------------------------------------------------------
+// In-app reminder notifications (spec section 28) — real, but scoped
+// honestly: this uses the browser's Notification API, checked on a client-
+// side interval while the app tab is open. It does NOT survive the tab
+// being closed or the device restarting — that requires Web Push with
+// VAPID keys and a push server, which needs an npm package this offline
+// sandbox can't install. See README for that as a documented next step.
+// A reminder fires at most once per (event, occurrence, offset) per page
+// load — reloading the page can re-fire a reminder still due "now"; that's
+// an accepted trade-off of not persisting notification state server-side.
+// ---------------------------------------------------------------------------
+const notifiedReminderKeys = new Set();
+let reminderPollTimer = null;
+
+function startReminderPolling() {
+  if (reminderPollTimer) clearInterval(reminderPollTimer);
+  checkDueReminders();
+  reminderPollTimer = setInterval(checkDueReminders, 60_000);
+}
+
+async function checkDueReminders() {
+  if (state.duress || !state.unlocked || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  try {
+    const res = await api('GET', '/api/events/upcoming?days=400');
+    const now = new Date();
+    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    for (const ev of res.events) {
+      if (!ev.notifyEnabled) continue;
+      for (const r of ev.reminders || []) {
+        if (Number(r.daysBefore) !== ev.daysRemaining) continue;
+        const [h, m] = String(r.time || '08:00').split(':').map(Number);
+        if (Math.abs(nowMinutes - (h * 60 + m)) > 2) continue; // within ~2 min of the scheduled time, given the 60s poll
+        const key = `${ev.id}|${ev.occurrenceDate}|${r.daysBefore}`;
+        if (notifiedReminderKeys.has(key)) continue;
+        notifiedReminderKeys.add(key);
+        fireReminderNotification(ev);
+      }
+    }
+  } catch { /* non-fatal — notifications are a convenience, not core function */ }
+}
+
+function fireReminderNotification(ev) {
+  const body = ev.daysRemaining === 0 ? `${ev.title} is today.` : ev.daysRemaining === 1 ? `${ev.title} is tomorrow.` : `${ev.title} is coming up.`;
+  try {
+    // Deliberately no sensitive vault content in the notification body —
+    // spec section 33 — only the event title the user themselves gave it.
+    new Notification('VAULTIXgusTAR Reminder', { body, icon: '/brand/icon-192.png', tag: ev.id });
+  } catch { /* Notification constructor can throw in some contexts (e.g. iOS Safari) — non-fatal */ }
+}
+
+function notifPermission() {
+  return typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
+}
+
 let idleTimer = null;
 function resetIdleWatch() {
   if (idleTimer) clearInterval(idleTimer);
@@ -195,12 +254,14 @@ document.addEventListener('keydown', (e) => {
 // Data loaders
 // ---------------------------------------------------------------------------
 async function loadDashboardData() {
-  const [summaryRes, activityRes] = await Promise.all([
+  const [summaryRes, activityRes, upcomingRes] = await Promise.all([
     api('GET', '/api/vault/summary'),
     api('GET', '/api/security/activity'),
+    api('GET', '/api/events/upcoming?days=60'),
   ]);
   state.summary = summaryRes.summary;
   state.activity = activityRes.events;
+  state.upcomingEvents = upcomingRes.events;
 }
 
 async function loadPasswords() {
@@ -253,6 +314,31 @@ async function loadMedical() {
   ]);
   state.medicalItems = { medical: medical.items, inheritance: inheritance.items };
 }
+async function loadCustomItems() {
+  const res = await api('GET', '/api/vault/items?type=custom');
+  state.customItems = res.items;
+}
+async function loadCalendar() {
+  if (!state.calendarCursor) {
+    const now = new Date();
+    state.calendarCursor = { year: now.getFullYear(), month: now.getMonth() };
+  }
+  const { year, month } = state.calendarCursor;
+  const from = localDateStr(new Date(year, month, 1));
+  const to = localDateStr(new Date(year, month + 1, 0));
+  const [rangeRes, upcomingRes] = await Promise.all([
+    api('GET', `/api/events?from=${from}&to=${to}`),
+    api('GET', '/api/events/upcoming?days=60'),
+  ]);
+  state.events = rangeRes.events;
+  state.upcomingEvents = upcomingRes.events;
+}
+function localDateStr(d) {
+  // Deliberately NOT toISOString() — that converts to UTC and can shift the
+  // date across midnight depending on the user's timezone offset, which
+  // would show events on the wrong day near month boundaries.
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 async function loadSecurity() {
   const [status, sessions] = await Promise.all([
     api('GET', '/api/security/status'),
@@ -287,11 +373,13 @@ async function navigate(key) {
     if (key === 'dashboard') await loadDashboardData();
     if (key === 'passwords' || key === 'emails') await loadPasswords();
     if (key === 'notes') await loadNotes();
+    if (key === 'custom') await loadCustomItems();
     if (key === 'personal') await loadPersonal();
     if (key === 'developer') await loadDeveloper();
     if (key === 'documents') await loadDocuments();
     if (key === 'physical') await loadPhysical();
     if (key === 'medical') await loadMedical();
+    if (key === 'calendar') await loadCalendar();
     if (key === 'security') { await loadSecurity(); state.health = null; }
     if (key === 'activity') await loadActivity();
     if (key === 'settings') await loadSecurity();
@@ -361,6 +449,8 @@ const ICON_PATHS = {
   account: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5a13 13 0 0 1 0 17"/><path d="M12 3.5a13 13 0 0 0 0 17"/>',
   x: '<path d="m6 6 12 12M18 6 6 18"/>',
   refresh: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 3.5v5.4h-5.4"/>',
+  droplet: '<path d="M12 3.5s6.5 7.4 6.5 12A6.5 6.5 0 0 1 5.5 15.5C5.5 10.9 12 3.5 12 3.5Z"/>',
+  bell: '<path d="M6 9a6 6 0 0 1 12 0v4.5l1.8 3H4.2L6 13.5Z"/><path d="M10 19.5a2 2 0 0 0 4 0"/>',
   backspace: '<path d="M9 6h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9l-6-6Z"/><path d="m11 10 4 4M15 10l-4 4"/>',
   activity: '<path d="M3 12h4l2.5-7L14 19l2.5-7H21"/>',
 };
@@ -386,6 +476,7 @@ const TYPE_ICON_NAME = {
   password: 'lock', email: 'mail', personal: 'user', id: 'idcard', note: 'note',
   wifi: 'wifi', contact: 'contact', account: 'account', apikey: 'key', sshkey: 'lock',
   wallet: 'key', physical: 'lock', license: 'idcard', medical: 'activity', inheritance: 'note', document: 'idcard',
+  custom: 'idcard',
 };
 const SENSITIVE_KEYS = new Set(Object.values(FIELD_CONFIGS).flat().filter((f) => f[2]).map((f) => f[0]).concat(['password']));
 // Which single non-secret field (if any) becomes the plaintext, unencrypted
@@ -452,11 +543,11 @@ function renderAuthShell(innerHtml) {
 function loginView() {
   return `
     <form id="login-form">
-      <div class="field"><label>Email / Username</label><input name="email" type="email" required placeholder="you@example.com" /></div>
+      <div class="field"><label>Email / Username</label><input name="email" type="email" required autocomplete="username" placeholder="you@example.com" /></div>
       <div class="field">
         <label>Master Password</label>
         <div class="pw-wrap">
-          <input name="password" type="password" required placeholder="••••••••••••••••" />
+          <input name="password" type="password" required autocomplete="current-password" placeholder="••••••••••••••••" />
           <button type="button" class="pw-toggle" data-toggle="password">${ICON.eye}</button>
         </div>
       </div>
@@ -483,10 +574,10 @@ function registerView() {
         <input type="file" id="avatar-file-input" accept="image/png,image/jpeg,image/webp" style="display:none;" />
         <button type="button" class="link-btn" id="avatar-pick-btn" style="justify-content:center;width:100%;margin-top:8px;">${icon('edit', 13)} Choose photo</button>
       </div>
-      <div class="field"><label>Full Name</label><input name="name" required placeholder="Your name" /></div>
-      <div class="field"><label>Recovery Email</label><input name="email" type="email" required placeholder="you@example.com" /></div>
-      <div class="field"><label>Create Master Password</label><input name="password" type="password" required minlength="8" placeholder="••••••••••••••••" /></div>
-      <div class="field"><label>Confirm Password</label><input name="confirm" type="password" required placeholder="••••••••••••••••" /></div>
+      <div class="field"><label>Full Name</label><input name="name" required autocomplete="name" placeholder="Your name" /></div>
+      <div class="field"><label>Recovery Email</label><input name="email" type="email" required autocomplete="email" placeholder="you@example.com" /></div>
+      <div class="field"><label>Create Master Password</label><input name="password" type="password" required minlength="8" autocomplete="new-password" placeholder="••••••••••••••••" /></div>
+      <div class="field"><label>Confirm Password</label><input name="confirm" type="password" required autocomplete="new-password" placeholder="••••••••••••••••" /></div>
       <div id="register-error"></div>
       <button class="btn btn-primary btn-block" type="submit">Create Secure Vault</button>
       <div class="field-hint">Your master password is hashed (scrypt) and never stored or transmitted in plain text. See README for the exact key-derivation architecture.</div>
@@ -575,10 +666,12 @@ const NAV = [
   ['emails', 'Emails', ICON.email],
   ['personal', 'Personal Details', ICON.personal],
   ['notes', 'Secure Notes', ICON.note],
+  ['custom', 'Custom Items', icon('idcard', 16)],
   ['developer', 'Developer & Crypto', icon('key', 16)],
   ['documents', 'Documents', ICON.id],
   ['physical', 'Physical & Licenses', icon('lock', 16)],
   ['medical', 'Medical & Estate', icon('activity', 16)],
+  ['calendar', 'Calendar', icon('clock', 16)],
   ['security', 'Security Centre', ICON.security],
   ['activity', 'Activity Log', ICON.activity],
   ['settings', 'Settings', ICON.settings],
@@ -628,10 +721,12 @@ function screenHtml() {
     case 'emails': return emailsScreen();
     case 'personal': return personalScreen();
     case 'notes': return notesScreen();
+    case 'custom': return customItemsScreen();
     case 'developer': return developerScreen();
     case 'documents': return documentsScreen();
     case 'physical': return physicalScreen();
     case 'medical': return medicalScreen();
+    case 'calendar': return calendarScreen();
     case 'security': return securityScreen();
     case 'activity': return activityScreen();
     case 'settings': return settingsScreen();
@@ -702,8 +797,35 @@ function dashboardScreen() {
         <button class="btn btn-outline btn-block" style="margin-top:12px;" data-nav="${state.duress ? 'passwords' : 'security'}">${state.duress ? 'View All Passwords' : 'Open Security Centre'}</button>
       </div>
     </div>
+    ${state.duress ? '' : upcomingDashboardCard()}
     ${state.duress ? '' : `<button class="btn btn-dark" style="margin-top:18px;" id="fab-add">${ICON.plus} Add Information</button>`}
   `;
+}
+
+function upcomingDashboardCard() {
+  const events = state.upcomingEvents || [];
+  const today = events.filter((e) => e.daysRemaining === 0);
+  const birthdays = events.filter((e) => e.eventType === 'birthday').slice(0, 3);
+  const expiring = events.filter((e) => e.eventType === 'expiry' && e.daysRemaining <= 30).slice(0, 3);
+  const upcoming = events.filter((e) => e.daysRemaining > 0).slice(0, 4);
+  if (events.length === 0) return '';
+  return `
+    <div class="card" style="padding:18px;margin-top:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <div style="font-weight:700;color:var(--navy);font-size:14.5px;">Calendar</div>
+        <button class="link-btn" data-nav="calendar">Open Calendar</button>
+      </div>
+      ${today.length ? `<div class="dash-cal-section"><div class="dash-cal-label">Today</div>${today.map(dashEventLine).join('')}</div>` : ''}
+      ${upcoming.length ? `<div class="dash-cal-section"><div class="dash-cal-label">Upcoming</div>${upcoming.map(dashEventLine).join('')}</div>` : ''}
+      ${birthdays.length ? `<div class="dash-cal-section"><div class="dash-cal-label">Birthdays</div>${birthdays.map(dashEventLine).join('')}</div>` : ''}
+      ${expiring.length ? `<div class="dash-cal-section"><div class="dash-cal-label">Expiring Soon</div>${expiring.map(dashEventLine).join('')}</div>` : ''}
+    </div>`;
+}
+
+function dashEventLine(ev) {
+  const meta = EVENT_TYPE_META[ev.eventType] || EVENT_TYPE_META.general;
+  const when = ev.daysRemaining === 0 ? 'Today' : ev.daysRemaining === 1 ? 'Tomorrow' : `${ev.daysRemaining} days remaining`;
+  return `<div class="dash-cal-item" data-event-id="${ev.id}">${icon(meta.icon, 14)}<span>${esc(ev.title)}</span><span class="dash-cal-when">${when}</span></div>`;
 }
 
 function isMac() {
@@ -763,20 +885,42 @@ function searchBody() {
     return `<div class="search-empty"><div class="search-spinner"></div><div>Searching…</div></div>`;
   }
   const results = state.searchResults || [];
-  if (results.length === 0) {
+  const events = state.searchEventResults || [];
+  if (results.length === 0 && events.length === 0) {
     return `<div class="search-empty"><div class="empty-icon">${ICON.search}</div><div>No matches for "${esc(q)}" in your vault.</div></div>`;
   }
+  const total = results.length + events.length;
   return `
-    <div class="search-result-count">${results.length} result${results.length === 1 ? '' : 's'}</div>
+    <div class="search-result-count">${total} result${total === 1 ? '' : 's'}</div>
     ${results.map((r) => `
       <button class="search-result-row" data-open-item="${r.id}">
         <div class="item-badge">${icon(TYPE_ICON_NAME[r.type] || 'note', 18)}</div>
         <div class="item-main">
           <div class="item-title">${esc(r.title)}</div>
-          <div class="item-sub">${labelForType(r.type)}${r.searchUsername ? ` · ${esc(r.searchUsername)}` : ''}</div>
+          <div class="item-sub">${searchMatchSubtitle(r)}</div>
+        </div>
+        ${icon('chevronRight', 15)}
+      </button>`).join('')}
+    ${events.map((e) => `
+      <button class="search-result-row" data-event-id="${e.id}">
+        <div class="item-badge">${icon((EVENT_TYPE_META[e.eventType] || EVENT_TYPE_META.general).icon, 18)}</div>
+        <div class="item-main">
+          <div class="item-title">${esc(e.title)}</div>
+          <div class="item-sub">Calendar · ${new Date(e.startDate).toLocaleDateString(undefined, { month: 'long', day: 'numeric' })}</div>
         </div>
         ${icon('chevronRight', 15)}
       </button>`).join('')}`;
+}
+
+/** Explains WHY a result matched (spec section 11) — never the raw value of a sensitive field. */
+function searchMatchSubtitle(r) {
+  const category = labelForType(r.type);
+  if (r.matchedIn === 'heading') return category;
+  if (r.matchedIn === 'field' && r.matchedField === 'Username/Email') return `${category} · ${esc(r.matchedExcerpt)}`;
+  if (r.matchedIn === 'category') return `${category} · Category: ${esc(r.matchedExcerpt)}`;
+  if (r.matchedIn === 'field-name') return `${category} · Matched field: ${esc(r.matchedField)}${r.matchedSensitive ? '' : r.matchedExcerpt ? `: ${esc(r.matchedExcerpt)}` : ''}`;
+  if (r.matchedIn === 'field-value') return `${category} · Matched: ${esc(r.matchedField)}${r.matchedSensitive ? ': ••••••••' : `: ${esc(r.matchedExcerpt)}`}`;
+  return category;
 }
 
 function openSearch() {
@@ -788,6 +932,7 @@ function openSearch() {
 function closeSearch() {
   state.searchOpen = false;
   state.searchResults = null;
+  state.searchEventResults = null;
   state.searchQuery = '';
   state.searchCategory = 'all';
   render();
@@ -860,6 +1005,16 @@ function bindSearchResultEvents() {
       } catch (err) { toast(err.message, 'error'); }
     };
   });
+  panel.querySelectorAll('[data-event-id]').forEach((el) => {
+    el.onclick = async () => {
+      try {
+        const res = await api('GET', `/api/events/${el.dataset.eventId}`);
+        closeSearch();
+        state.modal = { type: 'edit-event', event: res.event };
+        render();
+      } catch (err) { toast(err.message, 'error'); }
+    };
+  });
 }
 
 function labelForType(t) {
@@ -867,7 +1022,7 @@ function labelForType(t) {
     password: 'Password', email: 'Email', personal: 'Personal', note: 'Secure Note', id: 'ID Document',
     wifi: 'Wi-Fi', contact: 'Contact', account: 'Account', apikey: 'API Key', sshkey: 'SSH Key',
     wallet: 'Crypto Wallet', physical: 'Access Code', license: 'Software License',
-    medical: 'Medical Profile', inheritance: 'Digital Inheritance', document: 'Document',
+    medical: 'Medical Profile', inheritance: 'Digital Inheritance', document: 'Document', custom: 'Custom Item',
   }[t] || t;
 }
 
@@ -1034,6 +1189,22 @@ function documentsScreen() {
       </div>`).join('')}`;
 }
 
+function customItemsScreen() {
+  if (state.customItems.length === 0) {
+    return `<div class="empty-state"><div class="empty-icon">${icon('idcard', 22)}</div><div>No custom items yet. Give any information its own heading and fields — memberships, references, whatever doesn't fit elsewhere.</div><button class="btn btn-primary" id="open-add-custom">${ICON.plus} New Custom Item</button></div>`;
+  }
+  return `
+    <div style="display:flex;justify-content:flex-end;margin-bottom:16px;"><button class="btn btn-primary" id="open-add-custom">${ICON.plus} New Custom Item</button></div>
+    ${state.customItems.map((item) => `
+      <div class="card item-row" data-open-item="${item.id}" style="cursor:pointer;">
+        <div class="item-badge">${icon('idcard', 18)}</div>
+        <div class="item-main">
+          <div class="item-title">${esc(item.title)}</div>
+          <div class="item-sub">Updated ${timeAgo(item.updatedAt)}</div>
+        </div>
+      </div>`).join('')}`;
+}
+
 
 function securityScreen() {
   const sec = state.security;
@@ -1160,6 +1331,7 @@ function settingsScreen() {
         <div class="sec-row"><div class="sec-row-label">${icon('fingerprint',16)} Biometric Unlock</div><button class="toggle ${state.user.biometricEnabled ? 'on' : ''}" id="toggle-biometric"><span class="knob"></span></button></div>
         <div class="sec-row"><div class="sec-row-label">${icon('shield',16)} Two-Factor Authentication</div><button class="toggle ${sec.twoFactorEnabled ? 'on' : ''}" id="toggle-2fa-settings"><span class="knob"></span></button></div>
         <div class="sec-row"><div class="sec-row-label">${icon('warn',16)} Duress PIN</div><button class="link-btn" id="open-duress-pin">Set up</button></div>
+        <div class="sec-row"><div class="sec-row-label">${icon('bell',16)} Reminder Notifications</div><button class="toggle ${notifPermission() === 'granted' ? 'on' : ''}" id="toggle-notifications"><span class="knob"></span></button></div>
         <div style="padding:13px 0;">
           <div style="font-size:13.5px;font-weight:600;margin-bottom:8px;">Auto-Lock After</div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -1167,6 +1339,7 @@ function settingsScreen() {
           </div>
         </div>
         <div class="field-hint" style="margin-top:8px;">A duress PIN unlocks a harmless decoy screen instead of your real vault — useful if you're ever pressured to unlock it. It's indistinguishable from a normal unlock to anyone watching.</div>
+        <div class="field-hint">Reminder notifications only fire while this tab is open — closed-app delivery needs Web Push, noted as a next step in the README.</div>
       </div>`;
   } else if (tab === 'recovery') {
     body = `<div class="card" style="padding:20px;max-width:480px;"><div style="font-size:13.5px;font-weight:600;margin-bottom:4px;">Recovery Email</div><div style="font-size:13.5px;color:var(--text-muted);margin-bottom:16px;">${state.user.email}</div><div class="field-hint">Your recovery key was shown once, at account creation. If you no longer have it, generate a new one after unlocking with your master password (not wired up in this reference build — see README).</div></div>`;
@@ -1239,17 +1412,22 @@ function modalHtml() {
     <div class="add-grid">
       ${[
         ['password', 'Password', ICON.password], ['note', 'Secure Note', ICON.note],
-        ['personal', 'Personal Information', ICON.personal], ['apikey', 'API Key / Secret', icon('key', 18)],
+        ['personal', 'Personal Information', ICON.personal], ['custom-new', 'Custom Item', icon('idcard', 18)],
+        ['apikey', 'API Key / Secret', icon('key', 18)],
         ['sshkey', 'SSH Key', icon('lock', 18)], ['wallet', 'Crypto Wallet', icon('key', 18)],
         ['document', 'Document', ICON.id], ['physical', 'Physical Access Code', icon('lock', 18)],
         ['license', 'Software License', icon('idcard', 18)], ['medical', 'Medical Profile', icon('activity', 18)],
         ['inheritance', 'Digital Inheritance', ICON.note], ['wifi', 'Wi-Fi Credentials', ICON.wifi],
         ['contact', 'Contact', ICON.contact], ['account', 'Account', ICON.account],
+        ['event-new', 'Calendar Event', icon('clock', 18)],
       ].map(([type, label, ic]) => `<button class="add-opt" data-pick-type="${type}"><div class="icon">${ic}</div>${label}</button>`).join('')}
     </div>`);
   if (m.type === 'add-password' || m.type === 'edit-password') return passwordModal(m);
   if (m.type === 'add-note' || m.type === 'edit-note') return noteModal(m);
   if (m.type === 'add-generic' || m.type === 'edit-generic') return genericModal(m);
+  if (m.type === 'add-custom' || m.type === 'edit-custom') return customFieldsModal(m);
+  if (m.type === 'add-event' || m.type === 'edit-event') return eventModal(m);
+  if (m.type === 'reminder-suggestion') return reminderSuggestionModal(m);
   if (m.type === 'item-detail') return itemDetailModal(m);
   if (m.type === 'file-upload') return fileUploadModal(m);
   if (m.type === 'share-link') return shareLinkModal(m);
@@ -1322,26 +1500,422 @@ function titlePlaceholder(t) {
   return { wifi: 'Home_WiFi', contact: 'Mom', account: 'Netflix', apikey: 'AWS Production', sshkey: 'Prod Web Server', wallet: 'Main ETH Wallet', physical: 'Front Door', license: 'Windows 11 Pro', medical: 'Health Profile', inheritance: 'In Case of Emergency', document: 'Passport Scan' }[t] || 'Title';
 }
 
+// ---------------------------------------------------------------------------
+// Flexible custom fields — spec section 4: users are not limited to
+// predefined field sets. Every row is a free-form name/value pair the user
+// types themselves, with an optional "sensitive" flag (masked like a
+// password until revealed). Stored as payload: { fields: [...], notes }.
+// ---------------------------------------------------------------------------
+function customFieldsModal(m) {
+  const fields = m.fields || [];
+  return modalShell(m.item ? 'Edit Custom Item' : 'New Custom Item', `
+    <form id="custom-fields-form">
+      <div class="field"><label>Heading</label><input name="title" required value="${esc(m.title !== undefined ? m.title : (m.item?.title || ''))}" placeholder="e.g. My Important Information" autofocus /></div>
+      <div id="login-hint-container">${loginHintHtml(fields)}</div>
+      <div id="custom-field-rows">${customFieldRowsHtml(fields)}</div>
+      <button type="button" class="link-btn" id="add-custom-field-row" style="margin:4px 0 16px;">${icon('plus', 13)} Add Field</button>
+      <div class="field"><label>Notes (optional)</label><textarea name="notes" rows="2">${esc(m.item?.payload?.notes || '')}</textarea></div>
+      <button class="btn btn-primary btn-block" type="submit">Save Securely</button>
+    </form>`);
+}
+
+function customFieldRowsHtml(fields) {
+  return fields.map((f, i) => {
+    const sensitive = !!f.sensitive || isAutoSensitive(f.name);
+    return `
+    <div class="custom-field-row" data-row="${i}">
+      <input class="cf-name" value="${esc(f.name)}" placeholder="Field name (e.g. Membership Number)" />
+      <input class="cf-value" type="${sensitive ? 'password' : 'text'}" value="${esc(f.value)}" placeholder="Value" />
+      <label class="cf-sensitive" title="Mask this value like a password"><input type="checkbox" ${sensitive ? 'checked' : ''} />${icon('lock', 13)}</label>
+      <button type="button" class="icon-btn cf-remove" title="Remove field">${icon('x', 14)}</button>
+    </div>`;
+  }).join('');
+}
+
+/** Heuristic-only, spec section 5/10: an email/username field plus a password field suggests a login. Never auto-saves anything — just a suggestion the user can ignore. */
+// Mirrors server/vault.js AUTO_SENSITIVE_NAME_RE — a custom field named
+// "Password"/"PIN"/etc. is treated as sensitive even if the user forgot to
+// check the box. This is a floor applied at SAVE time (so the stored data
+// itself is correct downstream, not just this session's display) and again
+// at DISPLAY time as a safety net for anything saved before this existed.
+const AUTO_SENSITIVE_NAME_RE = /password|passphrase|\bpin\b|\bcvv\b|\bssn\b|secret|private\s*key|seed\s*phrase|license\s*key/i;
+function isAutoSensitive(name) {
+  return AUTO_SENSITIVE_NAME_RE.test(name || '');
+}
+
+function detectLoginPattern(fields) {
+  const hasCredential = fields.some((f) => /email|username|login\s*id/i.test(f.name));
+  const hasPassword = fields.some((f) => /password/i.test(f.name));
+  return hasCredential && hasPassword;
+}
+
+function loginHintHtml(fields) {
+  if (!detectLoginPattern(fields)) return '';
+  return `
+    <div class="rec-tip warn" style="margin-bottom:14px;">
+      ${ICON.warn} This looks like a login (an email/username and a password field). Consider using
+      <button type="button" class="link-btn" id="switch-to-password-entry" style="display:inline;padding:0;">Add Password</button>
+      instead — it keeps related credentials together and supports the password generator and breach checking.
+    </div>`;
+}
+
+function readCustomFieldRows() {
+  return Array.from(document.querySelectorAll('.custom-field-row')).map((row) => {
+    const name = row.querySelector('.cf-name').value.trim();
+    return {
+      name, value: row.querySelector('.cf-value').value,
+      sensitive: row.querySelector('.cf-sensitive input').checked || isAutoSensitive(name),
+    };
+  }).filter((f) => f.name || f.value);
+}
+
+function bindCustomFieldsFormEvents() {
+  const form = document.getElementById('custom-fields-form');
+  if (!form) return;
+
+  const addRowBtn = document.getElementById('add-custom-field-row');
+  if (addRowBtn) addRowBtn.onclick = () => {
+    state.modal.title = form.querySelector('[name="title"]').value;
+    state.modal.fields = readCustomFieldRows();
+    state.modal.fields.push({ name: '', value: '', sensitive: false });
+    render();
+    const rows = document.querySelectorAll('.custom-field-row .cf-name');
+    rows[rows.length - 1]?.focus();
+  };
+  document.querySelectorAll('.cf-remove').forEach((btn) => {
+    btn.onclick = () => {
+      state.modal.title = form.querySelector('[name="title"]').value;
+      const rows = readCustomFieldRows();
+      const idx = Number(btn.closest('.custom-field-row').dataset.row);
+      state.modal.fields = rows.filter((_, i) => i !== idx);
+      if (state.modal.fields.length === 0) state.modal.fields.push({ name: '', value: '', sensitive: false });
+      render();
+    };
+  });
+  document.querySelectorAll('.cf-sensitive input').forEach((checkbox) => {
+    checkbox.onchange = () => {
+      // Mask the value field the instant "sensitive" is checked, without a
+      // full re-render — a full render would lose focus/cursor position in
+      // whichever field the user is actively typing in.
+      const valueInput = checkbox.closest('.custom-field-row').querySelector('.cf-value');
+      valueInput.type = checkbox.checked ? 'password' : 'text';
+    };
+  });
+
+  // Live credential-detection (spec section 5/10) — recomputed on every
+  // keystroke in a field NAME, without a full re-render, so typing "Email"
+  // then "Password" as field names shows the hint immediately rather than
+  // only after the next Add/Remove Field click.
+  form.querySelectorAll('.cf-name').forEach((input) => {
+    input.oninput = () => {
+      document.getElementById('login-hint-container').innerHTML = loginHintHtml(readCustomFieldRows());
+      // Auto-mask the value the instant the field name looks sensitive
+      // (e.g. typing "Password") — same live-update approach as the
+      // sensitivity checkbox itself, so nothing sensitive is ever shown
+      // in the clear just because the user didn't think to check the box.
+      const row = input.closest('.custom-field-row');
+      const checkbox = row.querySelector('.cf-sensitive input');
+      if (isAutoSensitive(input.value) && !checkbox.checked) {
+        checkbox.checked = true;
+        row.querySelector('.cf-value').type = 'password';
+      }
+    };
+  });
+  // Event delegation for the hint's own button, since its DOM node gets
+  // replaced by the innerHTML swap above and a directly-bound handler
+  // would otherwise go stale after the first field-name keystroke.
+  form.onclick = (e) => {
+    if (e.target.id !== 'switch-to-password-entry') return;
+    const rows = readCustomFieldRows();
+    const emailField = rows.find((f) => /email|username|login\s*id/i.test(f.name));
+    const pwField = rows.find((f) => /password/i.test(f.name));
+    state.modal = {
+      type: 'add-password',
+      item: { title: form.querySelector('[name="title"]').value, searchUsername: emailField?.value || '', payload: { password: pwField?.value || '' } },
+    };
+    render();
+  };
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const fields = readCustomFieldRows();
+    if (fields.length === 0) { toast('Add at least one field.', 'warn'); return; }
+    const payload = { fields, notes: fd.get('notes') || '' };
+    try {
+      const editing = state.modal.item;
+      let saved;
+      if (editing) saved = await api('PUT', `/api/vault/items/${editing.id}`, { title: fd.get('title'), payload });
+      else saved = await api('POST', '/api/vault/items', { type: 'custom', title: fd.get('title'), payload });
+      toast(editing ? 'Updated' : 'Saved securely — your information has been encrypted and stored.');
+      state.modal = null;
+      await maybeSuggestReminders(fields, fd.get('title'), saved.item.id);
+      await navigate(state.active === 'custom' || state.active === 'dashboard' ? 'custom' : state.active);
+    } catch (err) { toast(err.message, 'error'); }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Smart date detection (spec sections 20, 25) — purely client-side, purely
+// a suggestion. Never creates a reminder without the user explicitly
+// clicking "Add Reminder"; a rejected/dismissed suggestion does nothing.
+// ---------------------------------------------------------------------------
+const DATE_FIELD_PATTERNS = [
+  { re: /\b(dob|date\s*of\s*birth|birth\s*date|birthday)\b/i, eventType: 'birthday', recurrence: 'annually', label: 'birthday' },
+  { re: /\b(expir\w*|renewal|valid\s*until)\b/i, eventType: 'expiry', recurrence: 'none', label: 'expiration/renewal' },
+  { re: /\banniversary\b/i, eventType: 'general', recurrence: 'annually', label: 'anniversary' },
+];
+
+function parseHumanDate(value) {
+  if (!value) return null;
+  const v = String(value).trim();
+  let m = v.match(/^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})$/); // DD/MM/YYYY
+  if (m) { const [, d, mo, y] = m; if (+mo <= 12 && +d <= 31) return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`; }
+  m = v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/); // YYYY-MM-DD
+  if (m) { const [, y, mo, d] = m; return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`; }
+  const parsed = new Date(v); // "15 September 2000" and similar — trust the browser's date parser
+  if (!isNaN(parsed) && v.length > 5) return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}-${String(parsed.getDate()).padStart(2, '0')}`;
+  return null;
+}
+
+function detectDateFields(fields) {
+  const found = [];
+  for (const f of fields) {
+    const isoDate = parseHumanDate(f.value);
+    if (!isoDate) continue;
+    const pattern = DATE_FIELD_PATTERNS.find((p) => p.re.test(f.name));
+    if (pattern) found.push({ fieldName: f.name, isoDate, ...pattern });
+  }
+  return found;
+}
+
+async function maybeSuggestReminders(fields, itemTitle, itemId) {
+  const detected = detectDateFields(fields);
+  if (detected.length === 0) return;
+  // One suggestion at a time — the user can add more manually from the
+  // Calendar screen if a second date field also looked meaningful.
+  const d = detected[0];
+  state.modal = { type: 'reminder-suggestion', detected: d, itemTitle, itemId };
+  render();
+}
+
+function reminderSuggestionModal(m) {
+  const d = m.detected;
+  const dateLabel = new Date(d.isoDate).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: d.eventType === 'birthday' ? undefined : 'numeric' });
+  const question = d.eventType === 'birthday'
+    ? `This looks like a birthday (${d.fieldName}: ${dateLabel}). Would you like an annual reminder?`
+    : d.label === 'anniversary'
+      ? `This looks like an anniversary (${d.fieldName}: ${dateLabel}). Would you like an annual reminder?`
+      : `This looks like an expiration or renewal date (${d.fieldName}: ${dateLabel}). Would you like a reminder before it's due?`;
+  const offsetOptions = d.eventType === 'birthday' || d.label === 'anniversary'
+    ? [[7, '7 days before'], [1, '1 day before'], [0, 'On the day']]
+    : [[365, '1 year before'], [180, '6 months before'], [90, '3 months before'], [30, '1 month before'], [7, '1 week before']];
+  return modalShell('Create a Reminder?', `
+    <div style="font-size:13.5px;color:var(--text);line-height:1.6;margin-bottom:16px;">${esc(question)}</div>
+    <div class="field"><label>Remind me</label>
+      <select id="reminder-offset">${offsetOptions.map(([days, label]) => `<option value="${days}">${label}</option>`).join('')}</select>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px;">
+      <button class="btn btn-ghost" id="reminder-dismiss">Not Now</button>
+      <button class="btn btn-primary" id="reminder-accept">${icon('plus', 15)} Add Reminder</button>
+    </div>
+  `);
+}
+
+// ---------------------------------------------------------------------------
+// Calendar / Events
+// ---------------------------------------------------------------------------
+const EVENT_TYPE_META = {
+  birthday: { icon: 'user', label: 'Birthday' },
+  expiry: { icon: 'clock', label: 'Expiry / Renewal' },
+  medication: { icon: 'activity', label: 'Medication' },
+  water: { icon: 'droplet', label: 'Water' },
+  general: { icon: 'note', label: 'Event' },
+};
+
+function calendarScreen() {
+  if (state.calendarView === 'upcoming') return upcomingEventsView();
+  return monthCalendarView();
+}
+
+function monthCalendarView() {
+  const { year, month } = state.calendarCursor;
+  const monthName = new Date(year, month, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  const firstDay = new Date(year, month, 1);
+  const startOffset = firstDay.getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const todayStr = todayISO();
+
+  const byDate = {};
+  for (const ev of state.events) (byDate[ev.occurrenceDate] = byDate[ev.occurrenceDate] || []).push(ev);
+
+  const cells = [];
+  for (let i = 0; i < startOffset; i++) cells.push('<div class="cal-cell cal-cell-empty"></div>');
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const dayEvents = byDate[dateStr] || [];
+    cells.push(`
+      <div class="cal-cell ${dateStr === todayStr ? 'cal-cell-today' : ''}">
+        <div class="cal-cell-day">${day}</div>
+        ${dayEvents.slice(0, 3).map((ev) => `<button class="cal-event-chip" data-event-id="${ev.id}" title="${esc(ev.title)}">${icon(EVENT_TYPE_META[ev.eventType]?.icon || 'note', 10)} ${esc(ev.title)}</button>`).join('')}
+        ${dayEvents.length > 3 ? `<div class="cal-more">+${dayEvents.length - 3} more</div>` : ''}
+      </div>`);
+  }
+
+  return `
+    <div class="cal-toolbar">
+      <div class="cal-nav">
+        <button class="icon-btn" id="cal-prev">${icon('arrowLeft', 16)}</button>
+        <div class="cal-month-label">${monthName}</div>
+        <button class="icon-btn" id="cal-next">${icon('arrowRight', 16)}</button>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="tab-btn" data-cal-view="upcoming">Upcoming</button>
+        <button class="btn btn-primary btn-sm" id="cal-add-event">${icon('plus', 14)} Add Event</button>
+      </div>
+    </div>
+    <div class="cal-grid cal-grid-head">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map((d) => `<div>${d}</div>`).join('')}</div>
+    <div class="cal-grid">${cells.join('')}</div>`;
+}
+
+function upcomingEventsView() {
+  const items = state.upcomingEvents || [];
+  return `
+    <div class="cal-toolbar">
+      <div style="font-weight:700;color:var(--navy);font-size:15px;">Upcoming</div>
+      <div style="display:flex;gap:8px;">
+        <button class="tab-btn" data-cal-view="month">Month View</button>
+        <button class="btn btn-primary btn-sm" id="cal-add-event">${icon('plus', 14)} Add Event</button>
+      </div>
+    </div>
+    ${items.length === 0 ? `<div class="empty-state"><div class="empty-icon">${icon('clock', 22)}</div><div>Nothing coming up in the next 60 days.</div></div>` : items.map((ev) => upcomingEventRow(ev)).join('')}`;
+}
+
+function upcomingEventRow(ev) {
+  const meta = EVENT_TYPE_META[ev.eventType] || EVENT_TYPE_META.general;
+  const when = ev.daysRemaining === 0 ? 'Today' : ev.daysRemaining === 1 ? 'Tomorrow' : `${ev.daysRemaining} days remaining`;
+  return `
+    <div class="card item-row" data-event-id="${ev.id}" style="cursor:pointer;">
+      <div class="item-badge">${icon(meta.icon, 18)}</div>
+      <div class="item-main">
+        <div class="item-title">${esc(ev.title)}</div>
+        <div class="item-sub">${new Date(ev.occurrenceDate).toLocaleDateString(undefined, { month: 'long', day: 'numeric' })} · ${when}</div>
+      </div>
+    </div>`;
+}
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function eventModal(m) {
+  const ev = m.event;
+  return modalShell(ev ? 'Edit Event' : 'New Event', `
+    <form id="event-form">
+      <div class="field"><label>Title</label><input name="title" required value="${esc(ev?.title || '')}" placeholder="e.g. Project Submission" /></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div class="field"><label>Date</label><input name="startDate" type="date" required value="${ev?.startDate || todayISO()}" /></div>
+        <div class="field"><label>Time (optional)</label><input name="startTime" type="time" value="${ev?.startTime || ''}" /></div>
+      </div>
+      <div class="field"><label>Category</label>
+        <select name="eventType">
+          ${Object.entries(EVENT_TYPE_META).map(([k, v]) => `<option value="${k}" ${ev?.eventType === k ? 'selected' : ''}>${v.label}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field"><label>Repeat</label>
+        <select name="recurrence">
+          ${[['none','Does not repeat'],['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['annually','Annually']].map(([k,l]) => `<option value="${k}" ${ev?.recurrence === k ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field"><label>Location (optional)</label><input name="location" value="${esc(ev?.location || '')}" /></div>
+      <div class="field"><label>Description (optional)</label><textarea name="description" rows="2">${esc(ev?.description || '')}</textarea></div>
+      <button class="btn btn-primary btn-block" type="submit">${ev ? 'Save Changes' : 'Create Event'}</button>
+      ${ev ? `<button type="button" class="btn btn-danger btn-block" id="delete-event-btn" style="margin-top:8px;">${ICON.trash} Delete Event</button>` : ''}
+    </form>`);
+}
+
+function bindEventFormEvents() {
+  const form = document.getElementById('event-form');
+  if (form) form.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const data = {
+      title: fd.get('title'), startDate: fd.get('startDate'), startTime: fd.get('startTime') || null,
+      eventType: fd.get('eventType'), recurrence: fd.get('recurrence'), location: fd.get('location') || null,
+      description: fd.get('description') || null,
+    };
+    try {
+      if (state.modal.event) await api('PUT', `/api/events/${state.modal.event.id}`, data);
+      else await api('POST', '/api/events', data);
+      toast('Saved');
+      state.modal = null;
+      await navigate('calendar');
+    } catch (err) { toast(err.message, 'error'); }
+  };
+  const deleteBtn = document.getElementById('delete-event-btn');
+  if (deleteBtn) deleteBtn.onclick = async () => {
+    try {
+      await api('DELETE', `/api/events/${state.modal.event.id}`);
+      toast('Event deleted');
+      state.modal = null;
+      await navigate('calendar');
+    } catch (err) { toast(err.message, 'error'); }
+  };
+}
+
+function bindReminderSuggestionEvents() {
+  const dismissBtn = document.getElementById('reminder-dismiss');
+  if (dismissBtn) dismissBtn.onclick = () => { state.modal = null; render(); };
+  const acceptBtn = document.getElementById('reminder-accept');
+  if (acceptBtn) acceptBtn.onclick = async () => {
+    const { detected, itemTitle, itemId } = state.modal;
+    const daysBefore = Number(document.getElementById('reminder-offset').value);
+    const title = detected.eventType === 'birthday' ? `${itemTitle}'s Birthday` : `${itemTitle} — ${detected.label}`;
+    try {
+      await api('POST', '/api/events', {
+        title, startDate: detected.isoDate, eventType: detected.eventType, recurrence: detected.recurrence,
+        linkedItemId: itemId, reminders: [{ daysBefore, time: '08:00' }],
+      });
+      toast('Reminder created');
+      state.modal = null;
+      render();
+    } catch (err) { toast(err.message, 'error'); }
+  };
+}
+
 function itemDetailModal(m) {
   const item = m.item;
   const revealed = !!state.revealCache[item.id];
   const payload = revealed ? state.revealCache[item.id] : item.payload;
-  return modalShell(item.title, `
-    <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:12px;">Category: ${labelForType(item.type)}</div>
-    ${Object.entries(payload || {}).filter(([,v]) => v !== '' && v !== undefined).map(([k, v]) => `
+  const fieldsHtml = item.type === 'custom'
+    ? (payload?.fields || []).filter((f) => f.name || f.value).map((f) => {
+      const sensitive = !!f.sensitive || isAutoSensitive(f.name); // safety net for items saved before auto-detection existed
+      return `
+      <div class="field"><label>${esc(f.name)}</label>
+        <div style="font-family:${sensitive ? 'monospace' : 'inherit'};font-size:13.5px;padding:10px 0;border-bottom:1px solid var(--border);white-space:pre-wrap;word-break:break-word;">
+          ${sensitive && !revealed ? '••••••••••••' : esc(f.value)}
+        </div>
+      </div>`;
+    }).join('') + (payload?.notes ? `<div class="field"><label>Notes</label><div style="font-size:13.5px;padding:10px 0;white-space:pre-wrap;">${esc(payload.notes)}</div></div>` : '')
+    : Object.entries(payload || {}).filter(([, v]) => v !== '' && v !== undefined).map(([k, v]) => `
       <div class="field"><label>${k[0].toUpperCase()}${k.slice(1).replace(/([A-Z])/g, ' $1')}</label>
         <div style="font-family:${SENSITIVE_KEYS.has(k) ? 'monospace' : 'inherit'};font-size:13.5px;padding:10px 0;border-bottom:1px solid var(--border);white-space:pre-wrap;word-break:break-word;">
-          ${SENSITIVE_KEYS.has(k) && !revealed ? '••••••••••••' : String(v)}
+          ${SENSITIVE_KEYS.has(k) && !revealed ? '••••••••••••' : esc(v)}
         </div>
-      </div>`).join('')}
+      </div>`).join('');
+  const hasSensitive = item.type === 'custom' ? (payload?.fields || []).some((f) => !!f.sensitive || isAutoSensitive(f.name)) : Object.keys(payload || {}).some((k) => SENSITIVE_KEYS.has(k));
+  return modalShell(esc(item.title), `
+    <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:12px;">Category: ${labelForType(item.type)}</div>
+    ${fieldsHtml}
     ${item.type === 'document' ? documentFileSection(item) : ''}
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
-      ${!revealed ? `<button class="btn btn-outline btn-sm" id="detail-reveal">${ICON.eye} Reveal</button>` : ''}
+      ${hasSensitive && !revealed ? `<button class="btn btn-outline btn-sm" id="detail-reveal">${ICON.eye} Reveal</button>` : ''}
       ${revealed ? `<button class="btn btn-subtle btn-sm" id="detail-copy">${ICON.copy} Copy</button>` : ''}
       ${revealed && item.type === 'password' ? `<button class="btn btn-subtle btn-sm" id="detail-breach-check">${icon('shield', 14)} Check for breaches</button>` : ''}
       ${revealed ? `<button class="btn btn-subtle btn-sm" id="detail-share">${icon('arrowRight', 14)} Share link</button>` : ''}
       <button class="btn btn-subtle btn-sm" id="detail-edit" data-id="${item.id}" data-type="${item.type}">${ICON.edit} Edit</button>
-      <button class="btn btn-subtle btn-sm" id="detail-delete" data-id="${item.id}" data-title="${item.title}">${ICON.trash} Delete</button>
+      <button class="btn btn-subtle btn-sm" id="detail-delete" data-id="${item.id}" data-title="${esc(item.title)}">${ICON.trash} Delete</button>
     </div>`);
 }
 
@@ -1382,9 +1956,9 @@ function confirmModal({ title, body, confirmLabel, danger }) {
 function changePasswordModal() {
   return modalShell('Change Master Password', `
     <form id="change-password-form">
-      <div class="field"><label>Current Master Password</label><input name="currentPassword" type="password" required /></div>
-      <div class="field"><label>New Master Password</label><input name="newPassword" type="password" required minlength="8" /></div>
-      <div class="field"><label>Confirm New Password</label><input name="confirm" type="password" required /></div>
+      <div class="field"><label>Current Master Password</label><input name="currentPassword" type="password" required autocomplete="current-password" /></div>
+      <div class="field"><label>New Master Password</label><input name="newPassword" type="password" required minlength="8" autocomplete="new-password" /></div>
+      <div class="field"><label>Confirm New Password</label><input name="confirm" type="password" required autocomplete="new-password" /></div>
       <div id="cp-error"></div>
       <button class="btn btn-primary btn-block" type="submit">Update Password</button>
     </form>`);
@@ -1438,6 +2012,7 @@ function bindAuthEvents() {
       await loadDashboardData();
       await loadAvatar(); loadRecentSearches();
       resetIdleWatch();
+  startReminderPolling();
       render();
     } catch (err) {
       state.loginAttempts++;
@@ -1511,6 +2086,7 @@ function bindAuthEvents() {
     await loadDashboardData();
     await loadAvatar(); loadRecentSearches();
     resetIdleWatch();
+  startReminderPolling();
     render();
   };
 
@@ -1614,6 +2190,7 @@ async function afterUnlock() {
   await loadDashboardData();
   await loadAvatar(); loadRecentSearches();
   resetIdleWatch();
+  startReminderPolling();
   render();
 }
 
@@ -1648,6 +2225,8 @@ function bindAppEvents() {
   bindNotesEvents();
   bindTabbedTypeEvents();
   bindDocumentsEvents();
+  bindCustomItemsEvents();
+  bindCalendarEvents();
   bindSecurityEvents();
   bindSettingsEvents();
 }
@@ -1660,7 +2239,7 @@ function bindDashboardEvents() {
 let searchRequestSeq = 0;
 async function runSearch() {
   const q = state.searchQuery.trim();
-  if (!q) { state.searchResults = null; state.searchLoading = false; renderPreservingSearchFocus(); return; }
+  if (!q) { state.searchResults = null; state.searchEventResults = null; state.searchLoading = false; renderPreservingSearchFocus(); return; }
   const mySeq = ++searchRequestSeq;
   state.searchLoading = true;
   renderPreservingSearchFocus();
@@ -1669,6 +2248,7 @@ async function runSearch() {
     const res = await api('GET', `/api/search?q=${encodeURIComponent(q)}${cat}`);
     if (mySeq !== searchRequestSeq) return; // a newer keystroke's request already superseded this one
     state.searchResults = res.results;
+    state.searchEventResults = res.events;
     state.searchLoading = false;
     saveRecentSearch(q);
     renderPreservingSearchFocus();
@@ -1770,8 +2350,10 @@ function bindPersonalEvents() {
         await api('POST', '/api/vault/items', { type: 'personal', title: 'Personal Information', payload });
       }
       toast('Personal information saved');
+      const detectionFields = PERSONAL_FIELDS.map(([key, label]) => ({ name: label, value: payload[key] }));
       await loadPersonal();
       render();
+      await maybeSuggestReminders(detectionFields, fd.get('fullName') || 'Personal Information', state.personalItem?.id);
     } catch (err) { toast(err.message, 'error'); }
   };
 }
@@ -1844,6 +2426,44 @@ function bindDocumentsEvents() {
   if (openAdd) openAdd.onclick = () => { state.modal = { type: 'add-generic', itemType: 'document' }; render(); };
 }
 
+function bindCustomItemsEvents() {
+  const openAdd = document.getElementById('open-add-custom');
+  if (openAdd) openAdd.onclick = () => { state.modal = { type: 'add-custom', fields: [{ name: '', value: '', sensitive: false }] }; render(); };
+}
+
+function bindCalendarEvents() {
+  const prevBtn = document.getElementById('cal-prev');
+  if (prevBtn) prevBtn.onclick = async () => {
+    let { year, month } = state.calendarCursor;
+    month--; if (month < 0) { month = 11; year--; }
+    state.calendarCursor = { year, month };
+    await loadCalendar();
+    render();
+  };
+  const nextBtn = document.getElementById('cal-next');
+  if (nextBtn) nextBtn.onclick = async () => {
+    let { year, month } = state.calendarCursor;
+    month++; if (month > 11) { month = 0; year++; }
+    state.calendarCursor = { year, month };
+    await loadCalendar();
+    render();
+  };
+  root.querySelectorAll('[data-cal-view]').forEach((btn) => {
+    btn.onclick = async () => { state.calendarView = btn.dataset.calView; await loadCalendar(); render(); };
+  });
+  const addBtn = document.getElementById('cal-add-event');
+  if (addBtn) addBtn.onclick = () => { state.modal = { type: 'add-event' }; render(); };
+  root.querySelectorAll('[data-event-id]').forEach((el) => {
+    el.onclick = async () => {
+      try {
+        const res = await api('GET', `/api/events/${el.dataset.eventId}`);
+        state.modal = { type: 'edit-event', event: res.event };
+        render();
+      } catch (err) { toast(err.message, 'error'); }
+    };
+  });
+}
+
 async function loadFileMetaFor(itemId) {
   state.fileMetaCache = state.fileMetaCache || {};
   state.fileMetaCache[itemId] = undefined;
@@ -1877,6 +2497,15 @@ function bindSettingsEvents() {
   root.querySelectorAll('[data-settings-tab]').forEach((btn) => { btn.onclick = () => { state.settingsTab = btn.dataset.settingsTab; render(); }; });
   const openCP = document.getElementById('open-change-password'); if (openCP) openCP.onclick = () => { state.modal = { type: 'change-password' }; render(); };
   const openPin = document.getElementById('open-change-pin'); if (openPin) openPin.onclick = () => { state.modal = { type: 'change-pin' }; render(); };
+  const toggleNotif = document.getElementById('toggle-notifications');
+  if (toggleNotif) toggleNotif.onclick = async () => {
+    if (typeof Notification === 'undefined') { toast('Notifications are not supported in this browser.', 'warn'); return; }
+    if (Notification.permission === 'granted') { toast('To turn notifications off, use your browser\'s site settings.', 'warn'); return; }
+    const perm = await Notification.requestPermission();
+    if (perm === 'granted') { toast('Reminder notifications enabled'); startReminderPolling(); }
+    else toast('Notifications permission was not granted.', 'warn');
+    render();
+  };
   const toggleBio = document.getElementById('toggle-biometric');
   if (toggleBio) toggleBio.onclick = async () => {
     if (state.user.biometricEnabled) {
@@ -2057,6 +2686,8 @@ function bindModalEvents() {
       if (type === 'password') state.modal = { type: 'add-password' };
       else if (type === 'note') state.modal = { type: 'add-note' };
       else if (type === 'personal') { state.modal = null; navigate('personal'); return; }
+      else if (type === 'custom-new') state.modal = { type: 'add-custom', fields: [{ name: '', value: '', sensitive: false }] };
+      else if (type === 'event-new') state.modal = { type: 'add-event' };
       else state.modal = { type: 'add-generic', itemType: type };
       render();
     };
@@ -2065,6 +2696,9 @@ function bindModalEvents() {
   bindPasswordFormEvents();
   bindNoteFormEvents();
   bindGenericFormEvents();
+  bindCustomFieldsFormEvents();
+  bindEventFormEvents();
+  bindReminderSuggestionEvents();
   bindReauthFormEvents();
   bindConfirmDeleteEvents();
   bindItemDetailEvents();
@@ -2178,11 +2812,15 @@ function bindGenericFormEvents() {
     const searchUsername = previewKey ? (payload[previewKey] || '') : undefined;
     try {
       const editing = state.modal.item;
-      if (editing) await api('PUT', `/api/vault/items/${editing.id}`, { title: fd.get('title'), payload, searchUsername });
-      else await api('POST', '/api/vault/items', { type, title: fd.get('title'), payload, searchUsername });
+      let saved;
+      if (editing) saved = await api('PUT', `/api/vault/items/${editing.id}`, { title: fd.get('title'), payload, searchUsername });
+      else saved = await api('POST', '/api/vault/items', { type, title: fd.get('title'), payload, searchUsername });
       toast(editing ? 'Updated' : 'Saved securely — your information has been encrypted and stored.');
       state.modal = null;
+      const configFields = FIELD_CONFIGS[type] || [];
+      const detectionFields = configFields.map(([key, label]) => ({ name: label, value: payload[key] }));
       await navigate(state.active);
+      await maybeSuggestReminders(detectionFields, fd.get('title'), saved.item.id);
     } catch (err) { toast(err.message, 'error'); }
   };
 }
@@ -2240,6 +2878,7 @@ function bindItemDetailEvents() {
     const item = await api('GET', `/api/vault/items/${editBtn.dataset.id}`);
     if (type === 'password') state.modal = { type: 'edit-password', item: item.item };
     else if (type === 'note') state.modal = { type: 'edit-note', item: item.item };
+    else if (type === 'custom') state.modal = { type: 'edit-custom', item: item.item, fields: item.item.payload?.fields?.length ? item.item.payload.fields : [{ name: '', value: '', sensitive: false }] };
     else state.modal = { type: 'edit-generic', itemType: type, item: item.item };
     render();
   };

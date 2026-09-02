@@ -526,7 +526,242 @@ Also not built: the multi-party **emergency access request/veto flow** (a contac
 
 ---
 
-## 16. Security review (honest self-assessment)
+## 16. Search, editing, custom fields, credentials & calendar — technical report
+
+This section documents the second major expansion: real vault-wide content
+search, flexible custom fields, a credential-detection hint, and a full
+calendar/reminders system. As with every other section of this README, it
+records exactly what changed and why — including two real bugs that were
+caught during testing and fixed before shipping, not glossed over.
+
+### What was wrong with the original search
+
+`server/vault.js searchItems()` only ever queried three plaintext SQL
+columns — `title`, `category`, `search_username` — via `LIKE '%term%'`. It
+never touched a record's actual encrypted content. Searching "Date of
+Birth" or a phone number typed into a Personal Information entry returned
+nothing, because that data only ever existed inside the encrypted
+`payload_ciphertext` blob, which the old search never decrypted.
+
+### How the new search works
+
+`searchItems(userId, vek, {...})` now requires the caller's own unlocked
+VEK (`GET /api/search` gained `unlockGuard`) and decrypts each of **that
+user's own** records to search field names and values, not just metadata —
+see `server/vault.js`. This is a deliberate trade-off, documented in the
+code: decrypting a personal vault's own records on every search (tens to
+low hundreds of items, not millions) is cheap and correct; it is not the
+same as building a plaintext index of everyone's ciphertext, and the SQL
+row-fetch itself is still filtered by `user_id = ?` before anything is
+decrypted, so it costs nothing extra in the cross-user-isolation sense.
+
+Two supporting pieces make this actually match the spec's examples:
+
+- **Field labels, not just JSON keys.** Built-in types store abbreviated
+  keys (`dob`, `fullName`); users search by what they see on screen ("Date
+  of Birth", "Full Name"). `FIELD_LABELS` in `server/vault.js` maps every
+  built-in key to its display label, and both the label and the raw key
+  are checked. A `custom` field's name already IS the label the user typed.
+- **Loose matching.** `normalizeLoose()` strips whitespace/punctuation
+  before a secondary comparison pass, so `"15/05/2000"`, `"15-05-2000"`,
+  and `"15 05 2000"` are treated as equivalent for values at least 3
+  characters long (short enough to avoid false positives on common words).
+
+Results are ranked (heading match → username → field value → field name →
+category) and each one reports **why** it matched (`matchedIn`,
+`matchedField`, `matchedExcerpt`) so the UI can show "Matched field: Date
+of Birth: 15/05/2000" instead of a bare title, per spec section 11.
+
+### How custom headings work
+
+Every vault item already had a user-supplied `title` — this was not a new
+field. What changed is that it's now the primary, highest-ranked search
+target, and every new item type (see below) surfaces it the same way.
+
+### How editing works
+
+Every item type — including the two new ones — supports full edit-in-place
+via `PUT /api/vault/items/:id`: the same row is updated (new IV, new
+ciphertext), never duplicated. The frontend routes edits through the
+correct modal per type (`public/app.js`, `detail-edit` handler) and shows
+"Updated" / a specific error message on failure, never a silent no-op.
+
+### How custom fields work
+
+A new item type, `custom` (`server/vault.js ALLOWED_TYPES`), stores
+`payload: { fields: [{name, value, sensitive}], notes }` — completely
+free-form. The UI (`customFieldsModal` in `public/app.js`) lets the user
+add/remove rows live, mark any field sensitive (masked like a password),
+and both the field **names** and **values** are fully searchable via the
+mechanism above.
+
+**A real bug was caught and fixed here during testing:** clicking "Add
+Field" or "Remove Field" triggers a re-render of the modal, and the first
+version of this rebuilt the Heading input from stale state, silently
+discarding whatever the user had already typed. This was caught by
+actually running the flow in a browser (not just reading the code) and
+fixed by capturing the live input value before every re-render — see the
+`state.modal.title` handling in `bindCustomFieldsFormEvents`.
+
+**A second, more serious bug was also caught and fixed:** a custom field
+named `"Password"` whose `sensitive` checkbox the user hadn't ticked showed
+its actual value in search-result previews — a direct violation of spec
+section 11. The fix adds a **name-based safety net on top of** the user's
+own flag, applied in three places so it can't be bypassed by skipping the
+UI: `AUTO_SENSITIVE_NAME_RE` in `server/vault.js` (search previews),
+`isAutoSensitive()` in `public/app.js` (save time, so the stored flag
+itself is correct going forward, and detail-view display for records saved
+before this fix existed). It can only turn sensitivity *on*, never
+override an explicit `sensitive: true` back to `false`. A regression test
+(`tests/search-content.test.js`, "a custom field literally named
+'Password'...") locks this in.
+
+### How credential detection and permission-to-save work
+
+VAULTIXgusTAR cannot observe *other* websites or apps — there is no
+legitimate way for a web app to detect what you're typing into a different
+site's login form; that would require a browser extension with broad
+content-script permissions, a fundamentally different (and far more
+invasive) piece of software than what's been built here. What it *can*
+honestly do, and does: inside its own "Custom Item" form, if the field
+names being typed look like a login (an email/username field plus a
+password field — `detectLoginPattern()`), it shows a dismissible hint
+suggesting the dedicated password-entry flow instead, live as you type
+(not just when you click Add Field). Nothing is ever saved, converted, or
+merged automatically — the user has to click through to a pre-filled
+"Add Password" form and explicitly hit Save. This satisfies the "user must
+remain in control, never silently save" requirement by construction: there
+is no code path that saves a credential without an explicit save click.
+
+### How PINs and temporary codes are handled
+
+Nothing in this app auto-captures a code from anywhere. A PIN is only ever
+stored when the user explicitly fills in a "Physical Access Code" or
+similar entry and clicks Save — the same explicit flow as everything else.
+There is no OTP-detection feature to build here because there is nothing
+generating or displaying OTPs to detect in the first place; the concern
+the spec raises (don't auto-save a transient 6-digit code) is satisfied
+trivially by there being no automatic capture path at all.
+
+### How autofill works, and its real limits
+
+`public/app.js`'s own login/register/change-password forms now carry
+correct `autocomplete` attributes (`username`, `current-password`,
+`new-password`) so the *browser's own* password manager can recognize and
+offer to fill VAULTIXgusTAR's login. That is the entire scope of what a
+web app can legitimately do for autofill — filling forms on *other* sites
+requires either a browser extension (content scripts with cross-origin
+form access) or, on Android, integrating with the platform's Credential
+Manager/Autofill Framework from a native app context. Neither is
+achievable from this Node.js + browser architecture, and no attempt was
+made to fake it.
+
+### The calendar / reminders system
+
+New `events` table (`server/db.js`) and `server/events.js` module — full
+CRUD, ownership-scoped exactly like every other table. Recurrence
+(`none`/`daily`/`weekly`/`monthly`/`annually`) is expanded on read via
+`expandOccurrences()`, never materialized as separate rows, so "17 days
+remaining" is always a fresh calculation against the current date, never
+hardcoded (tested explicitly in `tests/events.test.js`).
+
+- **Smart date detection**: saving a Personal Information, custom, or
+  other field-based entry scans field names against a small pattern set
+  (birthday/DOB, expiry/renewal, anniversary — `DATE_FIELD_PATTERNS` in
+  `public/app.js`) and, if a plausible date value is present, offers to
+  create a reminder. Purely a suggestion — "Not Now" does nothing, and
+  nothing is ever created without the explicit "Add Reminder" click.
+- **Calendar view** (month grid + Upcoming list), **dashboard
+  integration** (Today / Upcoming / Birthdays / Expiring Soon, all
+  computed fresh on every load), and **search integration** (`John` finds
+  both the vault entry and "John's Birthday"; `medicine` finds a
+  medication reminder) are all real, wired to the same authenticated,
+  ownership-scoped endpoints as everything else.
+- **Medication and water reminders** are just `events` with
+  `eventType: 'medication'/'water'` and daily recurrence — genuinely
+  buildable with no device sensor, unlike the location/step-tracking
+  features described below.
+- **Notifications** use the browser's `Notification` API, checked on a
+  60-second client-side interval while the tab is open
+  (`checkDueReminders()` in `public/app.js`). This is real and testable,
+  but it does **not** survive the tab being closed or the device
+  restarting — that requires Web Push with VAPID keys and a push server,
+  which needs an npm package this offline sandbox cannot install. It's
+  flagged as the concrete next step, not silently left out.
+
+### What was explicitly NOT built, and why (spec sections 37–62)
+
+Location history, step counting, and hourly activity tracking need
+continuous background GPS sessions and a pedometer/step-counter sensor —
+capabilities that exist in Android's Fused Location Provider and iOS's
+Core Motion, but have **no equivalent in the web platform at all**. This
+isn't a "harder to build" situation; a browser tab cannot count your steps
+or track your location while closed, full stop. Building a fake version of
+this would violate the explicit instruction not to pretend a capability
+works when it doesn't. The genuinely useful, buildable subset — scheduled
+reminders that don't need a sensor (medication, water) — was built for
+real, as above.
+
+### Files changed / added
+
+```
+server/db.js         + events table
+server/events.js     new — event CRUD, recurrence expansion, search
+server/vault.js       search rewritten (content-aware, unlock-gated),
+                       'custom' item type, AUTO_SENSITIVE_NAME_RE
+server/app.js          /api/search now unlock-gated + includes events;
+                       new /api/events* routes
+public/app.js          custom-fields modal, calendar screens, dashboard
+                       integration, search-result "why it matched" UI,
+                       smart date detection, credential-detection hint,
+                       in-app notifications, autocomplete attributes
+public/styles.css      calendar grid, custom-field rows, dashboard
+                       calendar card styles
+```
+
+### Database changes
+
+One new table, `events` (see `server/db.js` for the full schema and the
+comment explaining why it's plaintext, matching `vault_items.title`'s
+existing precedent, not AES-256-GCM encrypted like secret payloads). One
+new `vault_items.type` value, `'custom'` — no schema change needed, since
+custom fields reuse the existing encrypted-JSON-payload column.
+
+### Security measures preserved or added
+
+- Search requires an unlocked vault and is scoped to `user_id` at the SQL
+  level before any decryption happens (tested: cross-user search leakage,
+  locked-vault search rejection).
+- The two bugs described above (heading loss on re-render; sensitive
+  value leakage for an unflagged "Password" field) were both caught by
+  actually exercising the feature in a real browser, not just reading the
+  code, and both are now covered by regression tests.
+- Event ownership is enforced identically to vault items (tested:
+  cross-user read/delete/link rejection).
+- Notification bodies never include vault secrets — only the event title
+  the user themselves gave it.
+
+### Tests performed
+
+49 automated tests (`npm test`), all passing, including new coverage
+added for this expansion: `tests/search-content.test.js` (field-name
+search, field-value search, date/number search, case/punctuation
+tolerance, sensitive-value masking including the auto-detection fix,
+no-result handling, cross-user isolation, locked-vault rejection) and
+`tests/events.test.js` (CRUD, annual/monthly/weekly recurrence expansion
+including month-end clamping, dynamically-computed upcoming/today queries,
+vault-entry linking with ownership checks, cross-user isolation, search
+integration). Beyond the automated suite, every flow in this section was
+also driven end-to-end through an actual Chromium browser (Playwright) —
+registration through search, custom field creation and editing, the
+credential-detection hint appearing live while typing, reminder
+suggestion → calendar → dashboard → search, and event deletion — with
+screenshots inspected at each step, which is how both bugs above were
+actually found.
+
+---
+
+## 17. Security review (honest self-assessment)
 
 Per the brief's instruction not to claim "100% secure" — a plain summary of
 where this stands:
