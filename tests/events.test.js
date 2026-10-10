@@ -117,3 +117,72 @@ test('deleting an event is scoped to its owner', async () => {
   const stillThere = await owner.get(`/api/events/${created.body.event.id}`);
   assert.equal(stillThere.status, 200);
 });
+
+test('an event can have multiple reminders, all correctly scheduled and surfaced by due-reminders', async () => {
+  const c = makeClient(ctx.baseUrl);
+  await c.post('/api/auth/register', { name: 'ReminderUser', email: 'reminderuser@example.com', password: 'ReminderUser9!', recoveryEmail: 'reminderuser@example.com' });
+
+  const now = new Date();
+  const soon = new Date(now.getTime() + 2 * 60000); // 2 minutes from now
+  const dateStr = `${soon.getFullYear()}-${String(soon.getMonth() + 1).padStart(2, '0')}-${String(soon.getDate()).padStart(2, '0')}`;
+  const timeStr = `${String(soon.getHours()).padStart(2, '0')}:${String(soon.getMinutes()).padStart(2, '0')}`;
+
+  const created = await c.post('/api/events', {
+    title: 'Doctor Appointment', startDate: dateStr, startTime: timeStr, eventType: 'appointment',
+    reminders: [{ minutesBefore: 0 }, { minutesBefore: 2 }, { minutesBefore: 1440 }],
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.event.reminders.length, 3);
+
+  // The 2-minutes-before reminder should be due right now (event is 2 min away).
+  const due = await c.get('/api/events/due-reminders?withinMinutes=3');
+  const match = due.body.events.find((e) => e.id === created.body.event.id && e.reminderMinutesBefore === 2);
+  assert.ok(match, 'the 2-minutes-before reminder should be due now for an event 2 minutes away');
+
+  // The 1-day-before reminder should NOT be due yet.
+  const notYet = due.body.events.find((e) => e.id === created.body.event.id && e.reminderMinutesBefore === 1440);
+  assert.equal(notYet, undefined, 'the 1-day-before reminder should not be due for an event only 2 minutes away');
+});
+
+test('mark completed / reopen, and duplicate, work correctly and respect ownership', async () => {
+  const c = makeClient(ctx.baseUrl);
+  await c.post('/api/auth/register', { name: 'CompleteUser', email: 'completeuser@example.com', password: 'CompleteUser9!', recoveryEmail: 'completeuser@example.com' });
+  const created = await c.post('/api/events', { title: 'Task One', startDate: isoDaysFromNow(1), eventType: 'task' });
+
+  const completed = await c.post(`/api/events/${created.body.event.id}/complete`, { completed: true });
+  assert.equal(completed.body.event.completed, true);
+
+  // Completed events are excluded from "today"/"upcoming" by default.
+  const upcoming = await c.get('/api/events/upcoming?days=10');
+  assert.ok(!upcoming.body.events.some((e) => e.id === created.body.event.id));
+
+  const completedList = await c.get('/api/events/completed');
+  assert.ok(completedList.body.events.some((e) => e.id === created.body.event.id));
+
+  const reopened = await c.post(`/api/events/${created.body.event.id}/complete`, { completed: false });
+  assert.equal(reopened.body.event.completed, false);
+
+  const dup = await c.post(`/api/events/${created.body.event.id}/duplicate`, {});
+  assert.equal(dup.status, 201);
+  assert.equal(dup.body.event.title, 'Task One (Copy)');
+  assert.notEqual(dup.body.event.id, created.body.event.id);
+
+  const attacker = makeClient(ctx.baseUrl);
+  await attacker.post('/api/auth/register', { name: 'CompleteAttacker', email: 'completeattacker@example.com', password: 'CompleteAttacker9!', recoveryEmail: 'completeattacker@example.com' });
+  const badComplete = await attacker.post(`/api/events/${created.body.event.id}/complete`, { completed: true });
+  assert.equal(badComplete.status, 404);
+  const badDuplicate = await attacker.post(`/api/events/${created.body.event.id}/duplicate`, {});
+  assert.equal(badDuplicate.status, 404);
+});
+
+test('all nine event types are accepted, and an unknown type falls back to "personal" rather than erroring', async () => {
+  const c = makeClient(ctx.baseUrl);
+  await c.post('/api/auth/register', { name: 'TypeUser', email: 'typeuser@example.com', password: 'TypeUser9!', recoveryEmail: 'typeuser@example.com' });
+  const types = ['personal', 'birthday', 'appointment', 'medication', 'water', 'payment', 'security', 'task', 'custom'];
+  for (const t of types) {
+    const res = await c.post('/api/events', { title: `Event ${t}`, startDate: isoDaysFromNow(1), eventType: t });
+    assert.equal(res.body.event.eventType, t);
+  }
+  const fallback = await c.post('/api/events', { title: 'Weird Type', startDate: isoDaysFromNow(1), eventType: 'not-a-real-type' });
+  assert.equal(fallback.body.event.eventType, 'personal');
+});

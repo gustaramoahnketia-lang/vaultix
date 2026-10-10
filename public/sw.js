@@ -49,3 +49,37 @@ self.addEventListener('fetch', (event) => {
     })
   );
 });
+
+// ---------------------------------------------------------------------------
+// Web Push: incoming notifications and clicks. The server sends only the
+// event title and timing (see server/scheduler.js). Anything that does not
+// parse is ignored rather than shown.
+// ---------------------------------------------------------------------------
+self.addEventListener('push', (event) => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch { data = {}; }
+  const title = typeof data.title === 'string' ? data.title.slice(0, 80) : 'VAULTIXgusTAR';
+  const body = typeof data.body === 'string' ? data.body.slice(0, 200) : 'You have a reminder.';
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body,
+      icon: '/brand/icon-192.png',
+      badge: '/brand/favicon-32.png',
+      tag: typeof data.triggerKey === 'string' ? data.triggerKey : undefined,
+      data: { url: '/?open=calendar' },
+    })
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const target = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        if ('focus' in client) { client.navigate(target).catch(() => {}); return client.focus(); }
+      }
+      return self.clients.openWindow(target);
+    })
+  );
+});

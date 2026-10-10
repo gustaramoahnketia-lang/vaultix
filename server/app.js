@@ -5,7 +5,7 @@ import { db } from './db.js';
 import {
   hashSecret, verifySecret, deriveKey, wrapKey, unwrapKey,
   randomBytes, randomToken, passwordStrength, generatePassword,
-  encryptJSON, decryptJSON, sha256Hex,
+  encryptJSON, decryptJSON, sha256Hex, recoveryKeyPlain,
 } from './crypto.js';
 import {
   createUser, verifyLoginAndUnlock, openSession, publicUser,
@@ -15,6 +15,10 @@ import {
 import { cacheVek, getVek, dropVek, issueRecoveryCode, checkRecoveryCode, consumeRecoveryCode, ipRateLimited } from './store.js';
 import * as Vault from './vault.js';
 import * as Events from './events.js';
+import * as Activity from './activity.js';
+import * as Prefs from './preferences.js';
+import * as Push from './push.js';
+import * as Emergency from './emergency.js';
 import { Router, httpErr, sendJson } from './http-utils.js';
 
 export const router = new Router();
@@ -356,12 +360,9 @@ router.get('/api/search', authGuard, unlockGuard, async (req, res) => {
   const q = url.searchParams.get('q') || '';
   const category = url.searchParams.get('category') || undefined;
   const results = Vault.searchItems(req.user.id, req.vek, { q, category });
-  // Spec section 30: the main search also searches the calendar — "John" ->
-  // vault entry AND John's birthday reminder. Events are a distinct result
-  // shape (no payload/reveal semantics) so they're returned in their own
-  // array rather than merged into vault item results.
   const events = (!category || category === 'all' || category === 'event') ? Events.searchEvents(req.user.id, q) : [];
-  sendJson(res, 200, { results, events, count: results.length + events.length });
+  const activity = (!category || category === 'all' || category === 'activity') ? Activity.searchActivity(req.user.id, q) : null;
+  sendJson(res, 200, { results, events, activity, count: results.length + events.length + (activity ? 1 : 0) });
 });
 
 // ---------------------------------------------------------------------------
@@ -372,7 +373,8 @@ router.get('/api/events', authGuard, async (req, res) => {
   const from = url.searchParams.get('from');
   const to = url.searchParams.get('to');
   if (!from || !to) throw httpErr(400, 'from and to date parameters are required.');
-  sendJson(res, 200, { events: Events.listEventsInRange(req.user.id, from, to) });
+  const includeCompleted = url.searchParams.get('includeCompleted') !== 'false';
+  sendJson(res, 200, { events: Events.listEventsInRange(req.user.id, from, to, { includeCompleted }) });
 });
 
 router.get('/api/events/upcoming', authGuard, async (req, res) => {
@@ -383,6 +385,16 @@ router.get('/api/events/upcoming', authGuard, async (req, res) => {
 
 router.get('/api/events/today', authGuard, async (req, res) => {
   sendJson(res, 200, { events: Events.todayEvents(req.user.id) });
+});
+
+router.get('/api/events/completed', authGuard, async (req, res) => {
+  sendJson(res, 200, { events: Events.completedEvents(req.user.id) });
+});
+
+router.get('/api/events/due-reminders', authGuard, async (req, res) => {
+  const url = new URL(req.url, 'http://internal');
+  const withinMinutes = Math.min(10, Math.max(1, Number(url.searchParams.get('withinMinutes')) || 3));
+  sendJson(res, 200, { events: Events.dueReminders(req.user.id, withinMinutes) });
 });
 
 router.post('/api/events', authGuard, csrfGuard, async (req, res) => {
@@ -401,11 +413,208 @@ router.put('/api/events/:id', authGuard, csrfGuard, async (req, res) => {
   sendJson(res, 200, { event });
 });
 
+router.post('/api/events/:id/complete', authGuard, csrfGuard, async (req, res) => {
+  const event = Events.setCompleted(req.user.id, req.params.id, req.body.completed !== false);
+  logEvent(req.user.id, event.completed ? `Reminder marked complete: ${event.title}` : `Reminder reopened: ${event.title}`);
+  sendJson(res, 200, { event });
+});
+
+router.post('/api/events/:id/duplicate', authGuard, csrfGuard, async (req, res) => {
+  const event = Events.duplicateEvent(req.user.id, req.params.id);
+  logEvent(req.user.id, `Reminder duplicated: ${event.title}`);
+  sendJson(res, 201, { event });
+});
+
 router.delete('/api/events/:id', authGuard, csrfGuard, async (req, res) => {
   const existing = Events.getEvent(req.user.id, req.params.id);
   Events.deleteEvent(req.user.id, req.params.id);
   logEvent(req.user.id, `Reminder deleted: ${existing.title}`);
   sendJson(res, 200, { ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Activity -- GPS walking sessions only. See server/activity.js and README
+// "Activity module: what's real and what isn't" -- there is no step-count or
+// sensor-derived distance data source in this architecture.
+// ---------------------------------------------------------------------------
+router.post('/api/activity/sessions', authGuard, csrfGuard, async (req, res) => {
+  const session = Activity.saveSession(req.user.id, req.body);
+  logEvent(req.user.id, `Walking session recorded: ${session.distanceMiles.toFixed(1)} mi`);
+  sendJson(res, 201, { session });
+});
+
+router.get('/api/activity/sessions', authGuard, async (req, res) => {
+  const url = new URL(req.url, 'http://internal');
+  const fromMs = url.searchParams.get('from') ? Number(url.searchParams.get('from')) : undefined;
+  const toMs = url.searchParams.get('to') ? Number(url.searchParams.get('to')) : undefined;
+  sendJson(res, 200, { sessions: Activity.listSessions(req.user.id, { fromMs, toMs }) });
+});
+
+router.get('/api/activity/sessions/:id', authGuard, async (req, res) => {
+  sendJson(res, 200, { session: Activity.getSession(req.user.id, req.params.id) });
+});
+
+router.post('/api/activity/sessions/:id/clear-route', authGuard, csrfGuard, async (req, res) => {
+  const session = Activity.clearRoute(req.user.id, req.params.id);
+  logEvent(req.user.id, 'Walking route trail cleared');
+  sendJson(res, 200, { session });
+});
+
+router.delete('/api/activity/sessions/:id', authGuard, csrfGuard, async (req, res) => {
+  Activity.deleteSession(req.user.id, req.params.id);
+  sendJson(res, 200, { ok: true });
+});
+
+router.get('/api/activity/summary', authGuard, async (req, res) => {
+  const url = new URL(req.url, 'http://internal');
+  const fromMs = Number(url.searchParams.get('from'));
+  const toMs = Number(url.searchParams.get('to'));
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) throw httpErr(400, 'from and to (epoch ms) are required.');
+  sendJson(res, 200, Activity.dailySummary(req.user.id, fromMs, toMs));
+});
+
+// Public, unauthenticated: the browser needs the application server key before
+// it can subscribe. This is a PUBLIC key, safe to expose. The private key never
+// leaves the server. If VAPID isn't configured, the feature reports itself
+// unavailable rather than failing silently.
+router.get('/api/push/public-key', async (req, res) => {
+  const key = process.env.VAPID_PUBLIC_KEY || '';
+  sendJson(res, 200, { available: !!key, publicKey: key });
+});
+
+router.get('/api/push/devices', authGuard, async (req, res) => {
+  sendJson(res, 200, { devices: Push.listDevices(req.user.id) });
+});
+
+router.post('/api/push/devices', authGuard, csrfGuard, async (req, res) => {
+  const device = Push.registerSubscription(req.user.id, req.body || {});
+  logEvent(req.user.id, 'Notification device registered');
+  sendJson(res, 201, { device });
+});
+
+router.delete('/api/push/devices/:id', authGuard, csrfGuard, async (req, res) => {
+  Push.removeDevice(req.user.id, req.params.id);
+  logEvent(req.user.id, 'Notification device removed');
+  sendJson(res, 200, { ok: true });
+});
+
+// Account identity editing. Both changes require the master password, so a
+// stolen session alone cannot change how the account is identified or reached.
+router.put('/api/auth/account-details', authGuard, csrfGuard, async (req, res) => {
+  const { name, email, currentPassword } = req.body || {};
+  if (!currentPassword || !verifySecret(String(currentPassword), req.user.password_hash)) {
+    logEvent(req.user.id, 'Failed account-details change (password)');
+    throw httpErr(401, 'Your password is incorrect.');
+  }
+  const newName = name === undefined ? req.user.name : String(name).trim();
+  if (!newName || newName.length > 80) throw httpErr(400, 'Enter a name between 1 and 80 characters.');
+  let newEmail = req.user.email;
+  if (email !== undefined && String(email).trim().toLowerCase() !== req.user.email) {
+    newEmail = String(email).trim().toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(newEmail) || newEmail.length > 254) throw httpErr(400, 'Enter a valid email address.');
+    const taken = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(newEmail, req.user.id);
+    if (taken) throw httpErr(409, 'That email address is already in use on another account.');
+  }
+  db.prepare('UPDATE users SET name = ?, email = ? WHERE id = ?').run(newName, newEmail, req.user.id);
+  logEvent(req.user.id, 'Account details updated');
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  sendJson(res, 200, { user: publicUser(updated) });
+});
+
+// Regenerate the recovery key. The old key stops working immediately, because
+// the vault key is re-wrapped under a new one. Requires the master password and
+// an unlocked vault, and the new key is returned exactly once.
+router.post('/api/auth/recovery-key/regenerate', authGuard, csrfGuard, unlockGuard, async (req, res) => {
+  const { currentPassword } = req.body || {};
+  if (!currentPassword || !verifySecret(String(currentPassword), req.user.password_hash)) {
+    logEvent(req.user.id, 'Failed recovery-key regeneration (password)');
+    throw httpErr(401, 'Your password is incorrect.');
+  }
+  const newKey = recoveryKeyPlain();
+  const kekSalt = randomBytes(16);
+  const kek = deriveKey(newKey, kekSalt);
+  const wrapped = wrapKey(req.vek, kek);
+  db.prepare(`
+    UPDATE users SET recovery_key_hash = ?, recovery_kek_salt = ?,
+      wrapped_vek_recovery = ?, wrapped_vek_recovery_iv = ?, wrapped_vek_recovery_tag = ?
+    WHERE id = ?
+  `).run(hashSecret(newKey), kekSalt, wrapped.ciphertext, wrapped.iv, wrapped.tag, req.user.id);
+  logEvent(req.user.id, 'Recovery key regenerated');
+  sendJson(res, 200, { recoveryKey: newKey });
+});
+
+// ---------------------------------------------------------------------------
+// Emergency access. Owner routes need a session (and an unlocked vault to
+// invite, since the vault key must be wrapped). Contact routes do NOT use a
+// login: the contact proves possession of the secret the owner gave them.
+// ---------------------------------------------------------------------------
+router.get('/api/emergency', authGuard, async (req, res) => {
+  sendJson(res, 200, { contacts: Emergency.listForOwner(req.user.id), waitOptions: Emergency.WAIT_OPTIONS });
+});
+
+router.post('/api/emergency', authGuard, csrfGuard, unlockGuard, async (req, res) => {
+  const result = Emergency.invite(req.user.id, req.vek, req.body || {});
+  logEvent(req.user.id, 'Emergency contact invited');
+  // The secret is returned exactly once. It is not stored and cannot be shown again.
+  sendJson(res, 201, { contact: result.contact, secret: result.secret });
+});
+
+router.post('/api/emergency/:id/veto', authGuard, csrfGuard, async (req, res) => {
+  const contact = Emergency.veto(req.user.id, req.params.id);
+  logEvent(req.user.id, 'Emergency access request vetoed');
+  sendJson(res, 200, { contact });
+});
+
+router.post('/api/emergency/:id/revoke', authGuard, csrfGuard, async (req, res) => {
+  const contact = Emergency.revoke(req.user.id, req.params.id);
+  logEvent(req.user.id, 'Emergency contact revoked');
+  sendJson(res, 200, { contact });
+});
+
+// Contact side. No session: the contact's secret is the credential.
+router.post('/api/emergency/:id/request', async (req, res) => {
+  const contact = Emergency.requestAccess(req.params.id, req.body?.secret);
+  sendJson(res, 200, { contact });
+});
+
+router.post('/api/emergency/:id/status', async (req, res) => {
+  sendJson(res, 200, Emergency.getStatus(req.params.id, req.body?.secret));
+});
+
+router.post('/api/emergency/:id/view', async (req, res) => {
+  sendJson(res, 200, Emergency.viewReleased(req.params.id, req.body?.secret));
+});
+
+router.post('/api/emergency/:id/fetch', async (req, res) => {
+  const material = Emergency.fetchReleased(req.params.id, req.body?.secret);
+  sendJson(res, 200, material);
+});
+
+router.get('/api/preferences', authGuard, async (req, res) => {
+  sendJson(res, 200, Prefs.getPreferences(req.user.id));
+});
+
+router.put('/api/preferences/upcoming-window', authGuard, csrfGuard, async (req, res) => {
+  const prefs = Prefs.setUpcomingWindow(req.user.id, req.body?.days);
+  logEvent(req.user.id, 'Calendar preference updated');
+  sendJson(res, 200, prefs);
+});
+
+router.get('/api/activity/goal', authGuard, async (req, res) => {
+  sendJson(res, 200, Activity.goalProgress(req.user.id));
+});
+
+router.put('/api/activity/goal', authGuard, csrfGuard, async (req, res) => {
+  Activity.setGoal(req.user.id, req.body || {});
+  logEvent(req.user.id, 'Activity goal updated');
+  sendJson(res, 200, Activity.goalProgress(req.user.id));
+});
+
+router.get('/api/activity/query', authGuard, async (req, res) => {
+  const url = new URL(req.url, 'http://internal');
+  const q = url.searchParams.get('q') || '';
+  const result = Activity.searchActivity(req.user.id, q) || { hasData: false, answer: "I can only answer walking/distance questions right now -- try asking about steps, distance, or walking." };
+  sendJson(res, 200, result);
 });
 
 // ---------------------------------------------------------------------------

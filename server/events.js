@@ -4,20 +4,25 @@
 // server/vault.js: every query is scoped to `user_id = ?` bound from the
 // authenticated session, never from a client-supplied id.
 //
-// Recurrence is expanded on read, not stored as materialized rows — a
+// Recurrence is expanded on read, not stored as materialized rows -- a
 // "birthday" is one database row with recurrence='annually'; every place
 // that needs actual calendar dates (month view, upcoming list, today's
 // events, search) calls expandOccurrences() to compute which real dates
 // that row lands on within a given range, fresh, every time. Nothing here
-// is ever hardcoded — "17 days remaining" is always today's date subtracted
+// is ever hardcoded -- "17 days remaining" is always today's date subtracted
 // from a freshly computed next occurrence.
 
 import { randomUUID } from 'node:crypto';
 import { db } from './db.js';
 import { httpErr } from './http-utils.js';
 
-const EVENT_TYPES = ['birthday', 'expiry', 'medication', 'water', 'general'];
+export const EVENT_TYPES = ['personal', 'birthday', 'appointment', 'medication', 'water', 'payment', 'security', 'task', 'custom'];
 const RECURRENCES = ['none', 'daily', 'weekly', 'monthly', 'annually'];
+// Reminder presets, spec section 2 -- every reminder is stored uniformly as
+// { minutesBefore }, computed against the event's actual start time (or a
+// default of 09:00 if no time was set). "At event time" is minutesBefore=0;
+// "Custom" is just any other minute count the user typed in.
+export const REMINDER_PRESETS = [0, 5, 15, 30, 60, 120, 1440, 10080];
 
 function toDateOnly(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -28,6 +33,11 @@ function parseDateOnly(s) {
 }
 function daysInMonth(year, monthIndex) {
   return new Date(year, monthIndex + 1, 0).getDate();
+}
+function eventDateTime(dateStr, timeStr) {
+  const [y, mo, d] = dateStr.split('-').map(Number);
+  const [h, mi] = (timeStr || '09:00').split(':').map(Number);
+  return new Date(y, mo - 1, d, h, mi);
 }
 
 /**
@@ -54,8 +64,6 @@ export function expandOccurrences(event, fromStr, toStr) {
   }
 
   if (event.recurrence === 'weekly') {
-    // Walk from the first on-or-after-`from` date that's a multiple of 7
-    // days after start_date, per week, until past `to`.
     let d = new Date(start);
     if (d < from) {
       const diffDays = Math.floor((from - d) / 86400000);
@@ -71,8 +79,6 @@ export function expandOccurrences(event, fromStr, toStr) {
   if (event.recurrence === 'monthly') {
     const day = start.getDate();
     let year = from.getFullYear(), month = from.getMonth();
-    // Step month-by-month across the range, clamping to the last valid day
-    // (e.g. day=31 in a 30-day month lands on the 30th, not next month).
     for (;;) {
       const candidate = new Date(year, month, Math.min(day, daysInMonth(year, month)));
       if (candidate > to) break;
@@ -98,8 +104,21 @@ export function expandOccurrences(event, fromStr, toStr) {
 function parseReminders(json) {
   try {
     const arr = JSON.parse(json || '[]');
-    return Array.isArray(arr) ? arr : [];
+    return Array.isArray(arr) ? arr.filter((r) => r && Number.isFinite(r.minutesBefore)) : [];
   } catch { return []; }
+}
+
+function sanitizeReminders(input) {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const r of input) {
+    const minutes = Math.max(0, Math.round(Number(r?.minutesBefore)));
+    if (!Number.isFinite(minutes) || seen.has(minutes)) continue;
+    seen.add(minutes);
+    out.push({ minutesBefore: minutes });
+  }
+  return out.sort((a, b) => a.minutesBefore - b.minutesBefore);
 }
 
 function rowToEvent(row) {
@@ -115,6 +134,8 @@ function rowToEvent(row) {
     category: row.category,
     recurrence: row.recurrence,
     reminders: parseReminders(row.reminders),
+    completed: !!row.completed,
+    timezone: row.timezone,
     linkedItemId: row.linked_item_id,
     notifyEnabled: !!row.notify_enabled,
     createdAt: row.created_at,
@@ -123,7 +144,7 @@ function rowToEvent(row) {
 }
 
 export function createEvent(userId, data) {
-  const type = EVENT_TYPES.includes(data.eventType) ? data.eventType : 'general';
+  const type = EVENT_TYPES.includes(data.eventType) ? data.eventType : 'personal';
   const recurrence = RECURRENCES.includes(data.recurrence) ? data.recurrence : 'none';
   if (!data.title || !String(data.title).trim()) throw httpErr(400, 'A title is required.');
   if (!data.startDate || !/^\d{4}-\d{2}-\d{2}$/.test(data.startDate)) throw httpErr(400, 'A valid date (YYYY-MM-DD) is required.');
@@ -134,12 +155,13 @@ export function createEvent(userId, data) {
   const id = randomUUID();
   const now = Date.now();
   db.prepare(`
-    INSERT INTO events (id, user_id, title, event_type, start_date, start_time, end_time, location, description, category, recurrence, reminders, linked_item_id, notify_enabled, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO events (id, user_id, title, event_type, start_date, start_time, end_time, location, description, category, recurrence, reminders, completed, timezone, linked_item_id, notify_enabled, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
   `).run(
     id, userId, String(data.title).trim(), type, data.startDate, data.startTime || null, data.endTime || null,
     data.location || null, data.description || null, data.category || null, recurrence,
-    JSON.stringify(Array.isArray(data.reminders) ? data.reminders : []),
+    JSON.stringify(sanitizeReminders(data.reminders)),
+    data.timezone || null,
     data.linkedItemId || null, data.notifyEnabled === false ? 0 : 1, now, now,
   );
   return getEvent(userId, id);
@@ -176,7 +198,7 @@ export function updateEvent(userId, id, data) {
     data.description !== undefined ? data.description : row.description,
     data.category !== undefined ? data.category : row.category,
     recurrence,
-    data.reminders !== undefined ? JSON.stringify(data.reminders) : row.reminders,
+    data.reminders !== undefined ? JSON.stringify(sanitizeReminders(data.reminders)) : row.reminders,
     data.linkedItemId !== undefined ? data.linkedItemId : row.linked_item_id,
     data.notifyEnabled !== undefined ? (data.notifyEnabled ? 1 : 0) : row.notify_enabled,
     Date.now(), id, userId,
@@ -184,15 +206,31 @@ export function updateEvent(userId, id, data) {
   return getEvent(userId, id);
 }
 
-export function deleteEvent(userId, id) {
+export function setCompleted(userId, id, completed) {
   fetchOwnedRow(userId, id);
-  db.prepare('DELETE FROM events WHERE id = ? AND user_id = ?').run(id, userId);
+  db.prepare('UPDATE events SET completed = ?, updated_at = ? WHERE id = ? AND user_id = ?').run(completed ? 1 : 0, Date.now(), id, userId);
+  return getEvent(userId, id);
 }
 
-export function listEventsInRange(userId, fromStr, toStr) {
+export function duplicateEvent(userId, id) {
+  const row = fetchOwnedRow(userId, id);
+  return createEvent(userId, {
+    title: `${row.title} (Copy)`, eventType: row.event_type, startDate: row.start_date, startTime: row.start_time,
+    endTime: row.end_time, location: row.location, description: row.description, category: row.category,
+    recurrence: row.recurrence, reminders: parseReminders(row.reminders), timezone: row.timezone,
+  });
+}
+
+export function deleteEvent(userId, id) {
+  fetchOwnedRow(userId, id);
+  db.prepare('DELETE FROM events WHERE id = ? AND user_id = ?').run(id, userId); // reminders live as embedded JSON on this row -- deleting it cancels them too
+}
+
+export function listEventsInRange(userId, fromStr, toStr, { includeCompleted = true } = {}) {
   const rows = db.prepare('SELECT * FROM events WHERE user_id = ?').all(userId);
   const out = [];
   for (const row of rows) {
+    if (!includeCompleted && row.completed) continue;
     const occurrences = expandOccurrences(row, fromStr, toStr);
     for (const date of occurrences) out.push({ ...rowToEvent(row), occurrenceDate: date });
   }
@@ -204,8 +242,7 @@ export function upcomingEvents(userId, days = 60) {
   const today = new Date();
   const from = toDateOnly(today);
   const to = toDateOnly(new Date(today.getTime() + days * 86400000));
-  const occurrences = listEventsInRange(userId, from, to);
-  // One entry per event (its NEXT occurrence only), with a freshly computed day count.
+  const occurrences = listEventsInRange(userId, from, to, { includeCompleted: false });
   const seen = new Set();
   const out = [];
   for (const occ of occurrences) {
@@ -219,10 +256,41 @@ export function upcomingEvents(userId, days = 60) {
 
 export function todayEvents(userId) {
   const today = toDateOnly(new Date());
-  return listEventsInRange(userId, today, today);
+  return listEventsInRange(userId, today, today, { includeCompleted: false });
 }
 
-/** Vault-wide search integration (spec section 30) — matches title/description/location/category/type, case-insensitive. */
+export function completedEvents(userId, limit = 100) {
+  const rows = db.prepare('SELECT * FROM events WHERE user_id = ? AND completed = 1 ORDER BY updated_at DESC LIMIT ?').all(userId, limit);
+  return rows.map(rowToEvent);
+}
+
+/**
+ * Server-computed "what's due right now" (spec sections 3, 4, 6) -- the
+ * client polls this on an interval instead of reimplementing recurrence +
+ * reminder-offset math itself. Correctly handles multiple reminders per
+ * event and recurring events (a reminder is evaluated against each
+ * upcoming OCCURRENCE's actual date/time, not just the row's base date).
+ */
+export function dueReminders(userId, withinMinutes = 3) {
+  const now = Date.now();
+  const from = toDateOnly(new Date());
+  const to = toDateOnly(new Date(now + 8 * 86400000)); // 1-week-before reminders need up to 8 days of lookahead
+  const occurrences = listEventsInRange(userId, from, to, { includeCompleted: false });
+  const due = [];
+  for (const occ of occurrences) {
+    if (!occ.notifyEnabled) continue;
+    const evDateTime = eventDateTime(occ.occurrenceDate, occ.startTime).getTime();
+    for (const r of occ.reminders) {
+      const triggerAt = evDateTime - r.minutesBefore * 60000;
+      if (Math.abs(now - triggerAt) <= withinMinutes * 60000) {
+        due.push({ ...occ, reminderMinutesBefore: r.minutesBefore, triggerKey: `${occ.id}|${occ.occurrenceDate}|${r.minutesBefore}` });
+      }
+    }
+  }
+  return due;
+}
+
+/** Vault-wide search integration -- matches title/description/location/category/type, case-insensitive. */
 export function searchEvents(userId, q) {
   const term = q.trim().toLowerCase();
   if (!term) return [];
@@ -231,7 +299,6 @@ export function searchEvents(userId, q) {
   return rows.filter((row) => {
     const hay = [row.title, row.description, row.location, row.category, row.event_type].filter(Boolean).join(' ').toLowerCase();
     if (hay.includes(term)) return true;
-    // "September" / "15 September" style date searches against start_date.
     const d = parseDateOnly(row.start_date);
     const monthName = monthNames[d.getMonth()];
     if (monthName.includes(term)) return true;

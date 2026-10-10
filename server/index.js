@@ -79,6 +79,53 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Location-retention sweep (spec section 26). Runs once at startup, then once
+// a day, across all users. It is server housekeeping, not tied to any request.
+// The timer is unref'd so it never keeps the process alive on its own.
+import { pruneExpiredRoutes } from './activity.js';
+function runRouteRetentionSweep() {
+  try {
+    const n = pruneExpiredRoutes();
+    if (n > 0) console.log(`[VAULTIXgusTAR] Route retention: cleared ${n} expired walk trail(s).`);
+  } catch (err) {
+    console.error('[VAULTIXgusTAR] Route retention sweep failed:', err.message);
+  }
+}
+runRouteRetentionSweep();
+const RETENTION_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+setInterval(runRouteRetentionSweep, RETENTION_SWEEP_INTERVAL_MS).unref();
+
+// Reminder scheduler: every minute, deliver due reminders to each user's active
+// devices exactly once. Uses the real sender, which fails closed (reports
+// not-ready, never a delivery) if web-push or the VAPID keys are missing.
+// Unref'd so it never keeps the process alive by itself.
+import { runForUser } from './scheduler.js';
+import { sendToDevice, pushStatus } from './push-delivery.js';
+import { db as schedulerDb } from './db.js';
+const SCHEDULER_INTERVAL_MS = 60 * 1000;
+let schedulerRunning = false;
+async function runReminderScheduler() {
+  if (schedulerRunning) return; // never overlap two passes
+  schedulerRunning = true;
+  try {
+    if (!pushStatus().ready) return; // nothing can be sent yet; skip quietly
+    const users = schedulerDb.prepare('SELECT DISTINCT user_id FROM push_subscriptions WHERE active = 1').all();
+    for (const { user_id } of users) {
+      await runForUser(user_id, sendToDevice);
+    }
+  } catch (err) {
+    console.error('[VAULTIXgusTAR] Reminder scheduler error:', err.message);
+  } finally {
+    schedulerRunning = false;
+  }
+}
+setInterval(runReminderScheduler, SCHEDULER_INTERVAL_MS).unref();
+
+// Emergency-access release: every hour, release any request whose waiting period
+// has passed without a veto. Unref'd so it never keeps the process alive.
+import { releaseDue } from './emergency.js';
+setInterval(() => { try { releaseDue(); } catch (err) { console.error('[VAULTIXgusTAR] Emergency release error:', err.message); } }, 60 * 60 * 1000).unref();
+
 server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`VAULTIXgusTAR server listening on http://localhost:${PORT}`);

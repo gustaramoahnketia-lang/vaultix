@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
-  event_type TEXT NOT NULL DEFAULT 'general', -- birthday | expiry | medication | water | general
+  event_type TEXT NOT NULL DEFAULT 'personal', -- personal | birthday | appointment | medication | water | payment | security | task | custom
   start_date TEXT NOT NULL,   -- 'YYYY-MM-DD'
   start_time TEXT,            -- 'HH:MM', optional
   end_time TEXT,
@@ -168,13 +168,107 @@ CREATE TABLE IF NOT EXISTS events (
   description TEXT,
   category TEXT,
   recurrence TEXT NOT NULL DEFAULT 'none', -- none | daily | weekly | monthly | annually
-  reminders TEXT NOT NULL DEFAULT '[]',    -- JSON: [{daysBefore, time}]
+  reminders TEXT NOT NULL DEFAULT '[]',    -- JSON: [{minutesBefore}] -- see server/events.js
+  completed INTEGER NOT NULL DEFAULT 0,
+  timezone TEXT,               -- IANA name captured at creation, informational -- see README "Timezone support"
   linked_item_id TEXT REFERENCES vault_items(id) ON DELETE SET NULL,
   notify_enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_user_date ON events(user_id, start_date);
+
+-- GPS walking sessions (spec section 19) -- the one piece of "activity
+-- tracking" that's actually possible from a web browser (via the real
+-- Geolocation API, explicitly user-started). Distance is recomputed
+-- server-side from the raw points, never trusted from the client, so a
+-- tampered request can't claim an impossible distance.
+CREATE TABLE IF NOT EXISTS walking_sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  start_time INTEGER NOT NULL,
+  end_time INTEGER NOT NULL,
+  duration_seconds INTEGER NOT NULL,
+  distance_meters REAL NOT NULL,
+  points TEXT NOT NULL DEFAULT '[]', -- JSON: [[lat,lng,timestamp], ...] -- this session's route only
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_walking_user_time ON walking_sessions(user_id, start_time);
+
+-- Account-level preferences (one row per user). Stored server-side so a
+-- preference follows the account to every device, instead of living in one
+-- browser's localStorage. Only fields the server validates are accepted.
+-- One row per registered browser/device for Web Push. The endpoint is the
+-- push service URL the browser gave us; p256dh and auth_key are the public
+-- encryption keys the browser supplied. None of these are secrets, but they
+-- are personal device identifiers, so they are only ever returned to the
+-- owning user. The VAPID private key is NOT stored here -- it lives in an
+-- environment variable on the server only.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh_key TEXT NOT NULL,
+  auth_key TEXT NOT NULL,
+  device_name TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  last_used_at INTEGER,
+  last_seen_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id, active);
+
+-- Records every reminder that has been sent, keyed by the exact occurrence
+-- and offset. The primary key is what stops the same reminder being delivered
+-- twice, even if the scheduler runs twice or the server restarts mid-run.
+CREATE TABLE IF NOT EXISTS reminder_deliveries (
+  trigger_key TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sent_at INTEGER NOT NULL,
+  PRIMARY KEY (trigger_key, user_id)
+);
+
+-- Emergency access. The owner designates a contact and a waiting period. The
+-- vault key is wrapped under a key derived from a secret generated for the
+-- contact; the server never stores that secret, only the wrapped key and a hash
+-- used to check it. Status moves: invited -> requested -> released | revoked.
+CREATE TABLE IF NOT EXISTS emergency_access (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  contact_name TEXT NOT NULL,
+  contact_email TEXT NOT NULL,
+  wait_days INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'invited',
+  secret_hash TEXT NOT NULL,
+  kek_salt BLOB NOT NULL,
+  wrapped_vek BLOB NOT NULL,
+  wrapped_vek_iv BLOB NOT NULL,
+  wrapped_vek_tag BLOB NOT NULL,
+  requested_at INTEGER,
+  release_at INTEGER,
+  released_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ea_owner ON emergency_access(owner_id);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  upcoming_window_days INTEGER NOT NULL DEFAULT 60,
+  updated_at INTEGER NOT NULL
+);
+
+-- Personal activity goals (spec section 24/53). One row per user. The goal
+-- is the user's own target, never a recommendation: there is no default
+-- target and no "healthy" number. Progress is never stored here; it is
+-- computed on read from walking_sessions, so it cannot drift from the data.
+CREATE TABLE IF NOT EXISTS activity_goals (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  daily_distance_miles REAL,        -- NULL = no distance goal
+  daily_walk_minutes INTEGER,       -- NULL = no time goal
+  updated_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS security_events (
   id TEXT PRIMARY KEY,
@@ -190,5 +284,5 @@ CREATE INDEX IF NOT EXISTS idx_events_user ON security_events(user_id, created_a
 db.exec(SCHEMA);
 
 export function resetDatabaseForTests() {
-  db.exec('DELETE FROM shares; DELETE FROM events; DELETE FROM vault_files; DELETE FROM security_events; DELETE FROM vault_items; DELETE FROM sessions; DELETE FROM users;');
+  db.exec('DELETE FROM shares; DELETE FROM events; DELETE FROM walking_sessions; DELETE FROM activity_goals; DELETE FROM user_preferences; DELETE FROM emergency_access; DELETE FROM push_subscriptions; DELETE FROM reminder_deliveries; DELETE FROM vault_files; DELETE FROM security_events; DELETE FROM vault_items; DELETE FROM sessions; DELETE FROM users;');
 }

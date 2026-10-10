@@ -783,3 +783,175 @@ multi-instance deployment (would need Redis or similar); the VEK cache in
 `server/store.js` is per-process memory, so restarting the server logs
 every unlocked session out (arguably a feature — no VEK survives a
 restart — but worth knowing).
+
+## 19. Security review: calendar, walking & activity modules
+
+Scope: the event routes (`/api/events*`), the walking-session routes
+(`/api/activity*`), and the search endpoint's calendar and walking results.
+Method: a read of every route handler, a grep audit of every SQL statement in
+`server/events.js` and `server/activity.js`, and committed cross-user tests in
+`tests/calendar-activity-isolation.test.js`.
+
+### Findings
+
+| # | Area | Result |
+|---|------|--------|
+| 1 | Authentication | Every event and walking route requires `authGuard`. Confirmed by route listing. |
+| 2 | CSRF | Every state-changing route requires `csrfGuard`. A test confirms a write without the token returns 403, and a control test confirms the same write succeeds with the token (so the 403 is real, not an always-failing check). |
+| 3 | Ownership (SQL) | Every SELECT, UPDATE, and DELETE in both modules is scoped with `user_id = ?`. The one-line audit flagged an UPDATE as unscoped; reading the full statement showed the `WHERE id = ? AND user_id = ?` on the following line, so it was a false positive. |
+| 4 | Cross-user access | Verified with two live accounts across read, write, delete, duplicate, search, walk list, walk summary, and natural-language query. All returned 404 or empty. Committed as regression tests. |
+| 5 | Input validation | Walking sessions reject malformed coordinates, timestamps, too few points, and sessions over 6 hours. Event dates must match `YYYY-MM-DD`. Reminder values are clamped and de-duplicated. |
+| 6 | Server-side distance | Distance is computed on the server from the raw points. A client-supplied `distanceMeters` is ignored, and a test confirms an absurd claimed value has no effect. |
+| 7 | Honest data | The natural-language walking query never returns a step count. It answers only from stored sessions and says so when there is no data. |
+| 8 | Location data | Route points are stored only in the user's own `walking_sessions` row and are never returned by any other user's query. Deleting a session removes its points. |
+| 9 | Notification content | The notification body is limited by the user's privacy setting. At "hide" it contains no event title. |
+
+### Known limitations, not fixed here
+
+- **Notification privacy is per-device.** It's stored in the browser's local
+  storage, so it doesn't follow the user across devices.
+
+### Fixed in this round
+
+- **Location retention (was finding 8's gap).** Route trails are now removed
+  automatically 30 days after a session ends (`ROUTE_RETENTION_MS` in
+  `server/activity.js`). A daily sweep in `server/index.js` runs across all
+  users, and the session summary (distance, duration, times) is kept. The
+  30-day window is a judgment call, not a legal standard, so check it against
+  your own policy. Users can also clear one trail immediately with
+  `POST /api/activity/sessions/:id/clear-route`.
+- **Server-side point cap (was limitation 3).** The server now refuses any
+  session with more than `MAX_ROUTE_POINTS` (2000) points, so a direct API
+  call can't bypass the client limit.
+- **Tests.** `tests/route-retention.test.js` covers the window, the summary
+  surviving a prune, another user's trail being untouched, the manual clear,
+  and the server cap. A mutation check confirmed the tests fail when the sweep
+  is disabled.
+- **Search decrypts for the caller only.** Vault search decrypts the caller's
+  own items on each query. This is correct for isolation but costs time as the
+  vault grows.
+
+### Verdict
+
+No cross-user data exposure was found in the calendar, walking, or activity
+modules. The findings above are limitations and hardening items, not
+isolation failures. Location retention, the point cap, and
+per-session trail clearing are now in place. The remaining open limitation
+is per-device notification privacy.
+
+## 20. Push notifications, scheduler, and account settings: verification status
+
+This section records exactly what was verified and what was not, so no one
+mistakes the scheduler's tests for proof that real notifications reach a phone.
+
+### Verified here (automated tests, all passing)
+
+- **Account-synced upcoming window.** Stored per account, not per device.
+  Validated against an allowlist. Isolated per user, with forged user IDs in
+  the request body ignored. Mutation-tested: removing the ownership check makes
+  the isolation tests fail.
+- **Push device registration.** Validated endpoints (HTTPS only, bounded length),
+  validated keys, device-name sanitising (markup stripped, length capped).
+  An endpoint already registered to another account is refused, not moved.
+  Mutation-tested: removing the refusal makes the takeover test fail.
+- **Device list.** Never returns the push endpoint or the encryption keys.
+- **Scheduler.** A due reminder goes to every active device. A reminder is
+  recorded as sent only after at least one successful delivery, so a total
+  failure is retried. A reminder is never delivered twice, even across repeated
+  runs. A device reported gone by the push service is deactivated. A reminder
+  more than 15 minutes overdue is skipped, not sent late. Mutation-tested: removing
+  the duplicate guard makes the once-only test fail.
+- **Fail-closed sender.** Without the `web-push` package or VAPID keys, the real
+  sender reports not-ready and never claims a delivery.
+
+### NOT verified (cannot be done in this environment)
+
+- **Real push delivery.** `server/push-delivery.js` is written against the
+  `web-push` library's documented API, but it has never sent a notification,
+  because the package cannot be installed here. Treat it as unverified until it
+  runs against a real push service with real VAPID keys.
+- **Closed-app notifications.** Whether a notification arrives while the browser
+  is closed depends on the push service and the device. It has not been observed.
+- **Service-worker push handling.** `public/sw.js` does not yet handle incoming
+  push events or notification clicks. This is the next piece, and it cannot be
+  exercised without a real browser push.
+- **HealthKit and Health Connect.** Require native iOS and Android builds.
+  Not started.
+
+### To finish delivery on a real server
+
+1. `npm install web-push`
+2. Generate keys once: `npx web-push generate-vapid-keys`
+3. Set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT` (a `mailto:`
+   or `https:` URL).
+4. Schedule `runForUser` (in `server/scheduler.js`) with `sendToDevice` from
+   `server/push-delivery.js` as the sender, for every user with active devices.
+5. Add push and notificationclick handlers to `public/sw.js`.
+6. Test on a real device, with the browser closed, before relying on it.
+
+## 21. Permanent account and data persistence (Parts 51–52)
+
+### Where the account lives
+
+The authoritative copy of every account, vault item, calendar event, reminder,
+setting, activity goal, and walking session is the server's persistent database
+(SQLite, `data/vaultix.db` by default, set with `VAULTIX_DB_PATH`). Nothing is
+kept only in the browser.
+
+### What is stored in the browser, and why each is safe to lose
+
+| Browser storage | Purpose | Lost on reinstall? | Consequence |
+|---|---|---|---|
+| Recent searches | Convenience history | Yes | History resets. No account data. |
+| Notification privacy | Display choice | Yes | Reverts to the default. |
+| Goal-nudge flag | Stops a repeat notification the same day | Yes | At most one extra nudge. |
+| Biometric device token | Device-bound unlock secret | Yes | Biometric unlock must be turned on again on that device. The password still works. |
+
+The upcoming-calendar window is no longer in the browser. It is stored on the
+account (`user_preferences`) and follows the user to every device.
+
+### The one gap that remains
+
+The biometric device token cannot move to a new phone, because it is bound to
+the device that created it. This is a real limitation of device-bound unlock,
+not a data loss: the account and all data are intact, and the user re-enables
+biometrics on the new device. Making it fully seamless would need a platform
+passkey, which is covered under the deferred WebAuthn work in section 15.
+
+### Verified by automated tests (`tests/persistence.test.js`)
+
+- An account and every category of data (passwords, notes, personal details,
+  IDs, Wi-Fi, calendar events with reminders, settings, activity goal) created
+  on one client is fully retrievable from a brand-new client with no local state.
+- Secret content decrypts correctly on the new client.
+- A wrong password cannot retrieve the account.
+- The account survives a complete server restart, verified by checking the
+  database directly, not the live process.
+- A control test confirms that removing the database row makes the account
+  unrecoverable, so the persistence test depends on the database.
+
+## 22. Final status (this build)
+
+### Finished, tested, and checked in a browser
+
+- Accounts, vault (passwords, notes, personal details, IDs, Wi-Fi, custom items, API keys, wallets and more), search, and encrypted files.
+- Persistent account storage on the server. A new client recovers the full account (`tests/persistence.test.js`).
+- Account name and login-email editing, with the master password required.
+- Recovery-key regeneration with the master password. The old key stops working.
+- Calendar: 9 event types, multiple reminders, complete, duplicate, week/day/month/upcoming/completed views, and an account-synced upcoming window.
+- Walking: GPS sessions, history, daily goals, and a goal nudge.
+- Emergency access, end to end: the owner invites a contact and gets a one-time link. The contact requests access (the contact page shows the request button). The request waits out its period, and the owner can cancel it. After release, the contact opens the link and sees the owner's real items.
+- Automated tests: 139 backend tests pass. Deliberate breaks were used to confirm the key security tests fail when protection is removed.
+
+### Not finished (cannot be completed in this sandbox)
+
+1. **Closed-app push delivery.** Browser subscribe, service-worker handlers, and the server scheduler are all wired. The real sender needs `npm install web-push` plus VAPID keys, and it has never sent a notification. To finish: `npm install web-push`, run `npx web-push generate-vapid-keys`, set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT`, then test with the browser closed on a real device.
+2. **Emails for emergency access.** The one-time link has to be passed on by hand. Sending it needs an SMTP provider.
+3. **HealthKit and Health Connect.** These need native iOS and Android apps. Browsers cannot read step counts.
+4. **Biometric unlock on a new phone.** The biometric secret is bound to one device, so it has to be turned on again. Full passkey support is not built.
+5. **Reinstall test on real devices.** The persistence tests simulate a fresh client and a restarted server. Uninstall and reinstall on a real phone or browser has not been run.
+
+### Notes
+
+- The zip does not contain a database, so the app starts empty. Accounts are created on your own machine.
+- The zip does not contain `node_modules`. The project has no npm dependencies, so none are needed. Only the optional `web-push` step (item 1) installs a package.

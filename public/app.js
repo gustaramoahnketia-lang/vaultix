@@ -40,6 +40,8 @@ const state = {
   physicalTab: 'physical',
   events: [],
   calendarView: 'month', // 'month' | 'upcoming'
+  walkingSession: null, // { startedAt, points, watchId, tick } while a GPS walk is active -- in memory only
+  walkingHistory: [],
   calendarCursor: null, // {year, month} — set on first load
   activity: [],
   chainStatus: null,
@@ -170,6 +172,36 @@ function isStandalone() {
 // load — reloading the page can re-fire a reminder still due "now"; that's
 // an accepted trade-off of not persisting notification state server-side.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Closed-app push: subscribe this browser and register it with the server.
+// The server only ever receives the public subscription; the VAPID private key
+// stays on the server. If push is not configured, this reports that plainly.
+// ---------------------------------------------------------------------------
+function urlBase64ToUint8Array(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function enableClosedAppNotifications() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    throw new Error('This browser does not support background notifications.');
+  }
+  const pub = await api('GET', '/api/push/public-key');
+  if (!pub.available) throw new Error('Background notifications are not set up on this server yet.');
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') throw new Error('Notifications were not allowed in this browser.');
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(pub.publicKey) });
+  }
+  const json = sub.toJSON();
+  const deviceName = (navigator.userAgentData?.platform || navigator.platform || 'This device').slice(0, 40);
+  await api('POST', '/api/push/devices', { subscription: { endpoint: json.endpoint, keys: json.keys }, deviceName });
+  return true;
+}
+
 const notifiedReminderKeys = new Set();
 let reminderPollTimer = null;
 
@@ -179,34 +211,83 @@ function startReminderPolling() {
   reminderPollTimer = setInterval(checkDueReminders, 60_000);
 }
 
+// One gentle nudge a day, at most, if a personal goal is still unmet late in
+// the day. It is a reminder about the user's own target, never a health
+// judgment. It respects the notification privacy setting.
+const GOAL_NUDGE_HOUR = 18; // 6 PM local
+function goalNudgeKey() { return 'vx_goal_nudge_' + new Date().toDateString(); }
+async function maybeGoalNudge() {
+  if (new Date().getHours() < GOAL_NUDGE_HOUR) return;
+  try { if (localStorage.getItem(goalNudgeKey())) return; } catch { return; }
+  let prog;
+  try { prog = await api('GET', '/api/activity/goal'); } catch { return; }
+  if (!prog.goal || prog.goalMet) return;
+  try { localStorage.setItem(goalNudgeKey(), '1'); } catch { /* non-fatal */ }
+  const privacy = notifPrivacyLevel();
+  const title = 'VAULTIXgusTAR';
+  const body = privacy === 'hide' ? 'You have a reminder.' : 'Your personal walking goal for today is not yet reached.';
+  try { new Notification(title, { body, icon: '/brand/icon-192.png', tag: 'goal-nudge' }); } catch { /* non-fatal */ }
+}
+
 async function checkDueReminders() {
   if (state.duress || !state.unlocked || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
   try {
-    const res = await api('GET', '/api/events/upcoming?days=400');
-    const now = new Date();
-    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    // Server does the recurrence + multi-reminder-offset math
+    // (server/events.js dueReminders); the client only asks "what's due now".
+    const res = await api('GET', '/api/events/due-reminders?withinMinutes=2');
+    maybeGoalNudge();
     for (const ev of res.events) {
-      if (!ev.notifyEnabled) continue;
-      for (const r of ev.reminders || []) {
-        if (Number(r.daysBefore) !== ev.daysRemaining) continue;
-        const [h, m] = String(r.time || '08:00').split(':').map(Number);
-        if (Math.abs(nowMinutes - (h * 60 + m)) > 2) continue; // within ~2 min of the scheduled time, given the 60s poll
-        const key = `${ev.id}|${ev.occurrenceDate}|${r.daysBefore}`;
-        if (notifiedReminderKeys.has(key)) continue;
-        notifiedReminderKeys.add(key);
-        fireReminderNotification(ev);
-      }
+      if (notifiedReminderKeys.has(ev.triggerKey)) continue;
+      notifiedReminderKeys.add(ev.triggerKey);
+      fireReminderNotification(ev);
     }
-  } catch { /* non-fatal — notifications are a convenience, not core function */ }
+  } catch { /* non-fatal -- notifications are a convenience, not core function */ }
+}
+
+// Notification privacy (spec section 5) -- a per-device preference stored
+// locally; it only affects what this browser displays, never the server.
+// Upcoming window, in days. A per-device choice. The server accepts 1-365.
+const UPCOMING_WINDOW_OPTIONS = [[30, '30 days'], [60, '60 days'], [180, '6 months'], [365, '1 year']];
+// The account is the source of truth for this value (server: user_preferences).
+// The in-memory copy below is loaded from the server at sign-in and after each
+// change. It is never read back from localStorage, so the value follows the
+// account to every device.
+let upcomingWindowCache = 60;
+function upcomingWindowDays() { return upcomingWindowCache; }
+async function loadPreferences() {
+  try { upcomingWindowCache = (await api('GET', '/api/preferences')).upcomingWindowDays; }
+  catch { upcomingWindowCache = 60; }
+}
+async function setUpcomingWindowDays(days) {
+  const prefs = await api('PUT', '/api/preferences/upcoming-window', { days });
+  upcomingWindowCache = prefs.upcomingWindowDays;
+}
+
+function notifPrivacyLevel() {
+  return localStorage.getItem('vx_notif_privacy') || 'full';
+}
+function setNotifPrivacyLevel(level) {
+  try { localStorage.setItem('vx_notif_privacy', level); } catch { /* non-fatal */ }
 }
 
 function fireReminderNotification(ev) {
-  const body = ev.daysRemaining === 0 ? `${ev.title} is today.` : ev.daysRemaining === 1 ? `${ev.title} is tomorrow.` : `${ev.title} is coming up.`;
+  const privacy = notifPrivacyLevel();
+  const m = ev.reminderMinutesBefore;
+  const whenPhrase = m === 0 ? 'is now' : m < 60 ? `is in ${m} min` : m < 1440 ? `is in ${Math.round(m / 60)} hr` : 'is coming up';
+  let title = 'VAULTIXgusTAR';
+  let body;
+  if (privacy === 'hide') body = 'You have a security reminder.';
+  else if (privacy === 'limited') body = `You have a reminder ${whenPhrase}. Tap to view.`;
+  else { title = `VAULTIXgusTAR -- ${ev.title}`; body = `${ev.title} ${whenPhrase}. Tap to view event.`; }
   try {
-    // Deliberately no sensitive vault content in the notification body —
-    // spec section 33 — only the event title the user themselves gave it.
-    new Notification('VAULTIXgusTAR Reminder', { body, icon: '/brand/icon-192.png', tag: ev.id });
-  } catch { /* Notification constructor can throw in some contexts (e.g. iOS Safari) — non-fatal */ }
+    const n = new Notification(title, { body, icon: '/brand/icon-192.png', tag: ev.id });
+    n.onclick = () => {
+      window.focus();
+      state.active = 'calendar';
+      state.pendingOpenEventId = ev.id;
+      render();
+    };
+  } catch { /* Notification constructor can throw on some platforms -- non-fatal */ }
 }
 
 function notifPermission() {
@@ -254,14 +335,17 @@ document.addEventListener('keydown', (e) => {
 // Data loaders
 // ---------------------------------------------------------------------------
 async function loadDashboardData() {
-  const [summaryRes, activityRes, upcomingRes] = await Promise.all([
+  await loadPreferences();
+  const [summaryRes, activityRes, upcomingRes, walkRes] = await Promise.all([
     api('GET', '/api/vault/summary'),
     api('GET', '/api/security/activity'),
-    api('GET', '/api/events/upcoming?days=60'),
+    api('GET', `/api/events/upcoming?days=${upcomingWindowDays()}`),
+    api('GET', '/api/activity/sessions'),
   ]);
   state.summary = summaryRes.summary;
   state.activity = activityRes.events;
   state.upcomingEvents = upcomingRes.events;
+  state.walkingHistory = walkRes.sessions;
 }
 
 async function loadPasswords() {
@@ -326,12 +410,14 @@ async function loadCalendar() {
   const { year, month } = state.calendarCursor;
   const from = localDateStr(new Date(year, month, 1));
   const to = localDateStr(new Date(year, month + 1, 0));
-  const [rangeRes, upcomingRes] = await Promise.all([
+  const [rangeRes, upcomingRes, completedRes] = await Promise.all([
     api('GET', `/api/events?from=${from}&to=${to}`),
-    api('GET', '/api/events/upcoming?days=60'),
+    api('GET', `/api/events/upcoming?days=${upcomingWindowDays()}`),
+    api('GET', '/api/events/completed'),
   ]);
   state.events = rangeRes.events;
   state.upcomingEvents = upcomingRes.events;
+  state.completedEvents = completedRes.events;
 }
 function localDateStr(d) {
   // Deliberately NOT toISOString() — that converts to UTC and can shift the
@@ -346,6 +432,7 @@ async function loadSecurity() {
   ]);
   state.security = status;
   state.sessions = sessions.sessions;
+  state.emergency = (await api('GET', '/api/emergency')).contacts;
 }
 async function loadActivity() {
   const res = await api('GET', '/api/security/activity');
@@ -380,6 +467,7 @@ async function navigate(key) {
     if (key === 'physical') await loadPhysical();
     if (key === 'medical') await loadMedical();
     if (key === 'calendar') await loadCalendar();
+    if (key === 'walking') await loadWalking();
     if (key === 'security') { await loadSecurity(); state.health = null; }
     if (key === 'activity') await loadActivity();
     if (key === 'settings') await loadSecurity();
@@ -672,6 +760,7 @@ const NAV = [
   ['physical', 'Physical & Licenses', icon('lock', 16)],
   ['medical', 'Medical & Estate', icon('activity', 16)],
   ['calendar', 'Calendar', icon('clock', 16)],
+  ['walking', 'Walking', icon('activity', 16)],
   ['security', 'Security Centre', ICON.security],
   ['activity', 'Activity Log', ICON.activity],
   ['settings', 'Settings', ICON.settings],
@@ -727,6 +816,7 @@ function screenHtml() {
     case 'physical': return physicalScreen();
     case 'medical': return medicalScreen();
     case 'calendar': return calendarScreen();
+    case 'walking': return walkingScreen();
     case 'security': return securityScreen();
     case 'activity': return activityScreen();
     case 'settings': return settingsScreen();
@@ -798,8 +888,33 @@ function dashboardScreen() {
       </div>
     </div>
     ${state.duress ? '' : upcomingDashboardCard()}
+    ${state.duress ? '' : walkingDashboardCard()}
     ${state.duress ? '' : `<button class="btn btn-dark" style="margin-top:18px;" id="fab-add">${ICON.plus} Add Information</button>`}
   `;
+}
+
+// Dashboard walking card -- real recorded GPS sessions only. Shows the empty
+// state when nothing has been recorded. Never a step count (spec sections 18,
+// 30, 32: never fabricate activity measurements).
+function walkingDashboardCard() {
+  const sessions = state.walkingHistory || [];
+  const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+  const today = sessions.filter((w) => w.startTime >= startOfToday.getTime());
+  const todayMiles = today.reduce((sum, w) => sum + w.distanceMiles, 0);
+  const todaySeconds = today.reduce((sum, w) => sum + w.durationSeconds, 0);
+  return `
+    <div class="card" style="padding:18px;margin-top:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <div style="font-weight:700;color:var(--navy);font-size:14.5px;">Walking</div>
+        <button class="link-btn" data-nav="walking">Open Walking</button>
+      </div>
+      ${today.length
+        ? `<div style="display:flex;gap:24px;">
+             <div><div class="stat-label">Today's walking</div><div class="stat-value">${todayMiles.toFixed(2)} mi</div></div>
+             <div><div class="stat-label">Time walking</div><div class="stat-value">${fmtDuration(todaySeconds)}</div></div>
+           </div>`
+        : `<div style="font-size:13px;color:var(--text-muted);">No walking sessions recorded today. Start one from the Walking screen.</div>`}
+    </div>`;
 }
 
 function upcomingDashboardCard() {
@@ -1206,6 +1321,205 @@ function customItemsScreen() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Walking (GPS) -- spec section 19. The only "activity" feature a web browser
+// can genuinely provide: a user-started session using the real Geolocation
+// API. There are NO step counts here -- the browser has no access to a
+// pedometer or HealthKit/Health Connect. The UI says so plainly.
+// ---------------------------------------------------------------------------
+const WALK_SAMPLE_MIN_INTERVAL_MS = 5000; // at most one point every 5s -- battery-conscious (spec section 59)
+const WALK_MAX_POINTS = 2000;             // hard cap so a forgotten session can't grow unbounded
+
+function goalPanelHtml() {
+  const g = state.goalProgress;
+  if (!g || !g.goal) {
+    return `
+    <div class="card" style="padding:18px;margin-bottom:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div><div style="font-weight:700;color:var(--navy);font-size:14.5px;">Daily goal</div>
+        <div class="field-hint">No goal set. Goals are your own targets, and you can change or remove them any time.</div></div>
+        <button class="btn btn-outline btn-sm" id="goal-edit">Set a goal</button>
+      </div>
+    </div>`;
+  }
+  const rows = [];
+  if (g.goal.dailyDistanceMiles) rows.push(`<div style="font-size:13px;">Distance: <b>${g.today.miles.toFixed(2)}</b> of ${g.goal.dailyDistanceMiles} mi (${g.distancePct}%)</div>`);
+  if (g.goal.dailyWalkMinutes) rows.push(`<div style="font-size:13px;">Walking time: <b>${g.today.minutes}</b> of ${g.goal.dailyWalkMinutes} min (${g.timePct}%)</div>`);
+  return `
+    <div class="card" style="padding:18px;margin-bottom:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">
+        <div style="font-weight:700;color:var(--navy);font-size:14.5px;">Daily goal ${g.goalMet ? '<span style="color:var(--success);font-size:12px;">· reached</span>' : ''}</div>
+        <button class="link-btn" id="goal-edit">Edit</button>
+      </div>
+      ${rows.join('')}
+      <div class="field-hint" style="margin-top:8px;">Based only on walks you recorded today.</div>
+    </div>`;
+}
+
+function goalEditModal() {
+  const g = state.goalProgress?.goal;
+  return modalShell('Daily goal', `
+    <form id="goal-form">
+      <div class="field"><label>Distance (miles, optional)</label><input name="dailyDistanceMiles" type="number" step="0.1" min="0" max="100" value="${g?.dailyDistanceMiles ?? ''}" placeholder="e.g. 2" /></div>
+      <div class="field"><label>Walking time (minutes, optional)</label><input name="dailyWalkMinutes" type="number" step="1" min="0" max="600" value="${g?.dailyWalkMinutes ?? ''}" placeholder="e.g. 30" /></div>
+      <div class="field-hint" style="margin-bottom:12px;">Leave both blank to remove the goal. These are personal targets, not recommendations.</div>
+      <button class="btn btn-primary btn-block" type="submit">Save goal</button>
+    </form>`);
+}
+
+function walkingScreen() {
+  const active = state.walkingSession;
+  const hist = state.walkingHistory || [];
+  const geoSupported = 'geolocation' in navigator;
+  return `
+    ${goalPanelHtml()}
+    <div class="card" style="padding:20px;margin-bottom:16px;">
+      <div style="font-weight:700;color:var(--navy);font-size:15px;margin-bottom:6px;">Walking session</div>
+      <div class="field-hint" style="margin-bottom:14px;">
+        Records your route using your device's location while the session is running. Location is only read while a session is open, and it stops the moment you press Stop. Battery use is higher during a session.
+      </div>
+      ${!geoSupported ? `<div class="warn-banner">This browser doesn't support location, so walking sessions aren't available here.</div>` : ''}
+      ${active ? `
+        <div class="rec-tip success" style="margin-bottom:12px;">${icon('lock', 14)} Walking session active -- location is being recorded.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+          <div><div class="stat-label">Elapsed</div><div class="stat-value" id="walk-elapsed">0:00</div></div>
+          <div><div class="stat-label">Distance</div><div class="stat-value" id="walk-distance">0.00 mi</div></div>
+        </div>
+        <button class="btn btn-danger btn-block" id="walk-stop">Stop session</button>
+      ` : `
+        <button class="btn btn-primary btn-block" id="walk-start" ${geoSupported ? '' : 'disabled'}>${icon('activity', 15)} Start walking session</button>
+      `}
+    </div>
+    <div style="font-weight:700;color:var(--navy);font-size:14px;margin:6px 0 10px;">History</div>
+    ${hist.length === 0 ? `<div class="empty-state"><div class="empty-icon">${icon('activity', 22)}</div><div>No walking sessions recorded yet.</div></div>`
+      : hist.map((w) => `
+        <div class="card item-row">
+          <div class="item-badge">${icon('activity', 18)}</div>
+          <div class="item-main">
+            <div class="item-title">${w.distanceMiles.toFixed(2)} mi walked</div>
+            <div class="item-sub">${new Date(w.startTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · ${fmtDuration(w.durationSeconds)} · ${w.avgSpeedMph.toFixed(1)} mph</div>
+          </div>
+          <button class="icon-btn" data-walk-delete="${w.id}" title="Delete session">${ICON.trash}</button>
+        </div>`).join('')}
+    <div class="field-hint" style="margin-top:14px;">Step counts and daily sensor totals aren't available in a web browser. They need the native iPhone or Android app, which reads the phone's own health data.</div>`;
+}
+
+function fmtDuration(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+  return h ? `${h}h ${m}m` : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function haversineMiles(lat1, lng1, lat2, lng2) {
+  const R = 3958.8, toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function startWalkingSession() {
+  if (!('geolocation' in navigator)) { toast('Location is not available on this device.', 'error'); return; }
+  const session = { startedAt: Date.now(), points: [], watchId: null, lastSampleAt: 0, tick: null };
+  session.watchId = navigator.geolocation.watchPosition(
+    (pos) => {
+      const now = Date.now();
+      if (session.points.length && now - session.lastSampleAt < WALK_SAMPLE_MIN_INTERVAL_MS) return;
+      if (session.points.length >= WALK_MAX_POINTS) return;
+      session.lastSampleAt = now;
+      session.points.push([pos.coords.latitude, pos.coords.longitude, now]);
+      updateWalkingLiveStats(session);
+    },
+    (err) => {
+      if (err.code === 1) { toast('Location permission was denied. Enable it in your browser settings to record walks.', 'error'); stopWalkingSession(false); }
+      else toast('Could not get a location fix. Make sure location services are on.', 'warn');
+    },
+    { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 }
+  );
+  state.walkingSession = session;
+  session.tick = setInterval(() => updateWalkingLiveStats(session), 1000);
+  render();
+}
+
+function updateWalkingLiveStats(session) {
+  const el = document.getElementById('walk-elapsed');
+  const dist = document.getElementById('walk-distance');
+  if (el) el.textContent = fmtDuration((Date.now() - session.startedAt) / 1000);
+  if (dist) {
+    let miles = 0;
+    for (let i = 1; i < session.points.length; i++) {
+      const [a, b, t1] = session.points[i - 1], [c, d, t2] = session.points[i];
+      const seg = haversineMiles(a, b, c, d);
+      if (seg / Math.max(1 / 3600, (t2 - t1) / 3600000) <= 33) miles += seg; // same jitter guard as the server
+    }
+    dist.textContent = `${miles.toFixed(2)} mi`;
+  }
+}
+
+async function stopWalkingSession(save = true) {
+  const session = state.walkingSession;
+  if (!session) return;
+  if (session.watchId !== null) navigator.geolocation.clearWatch(session.watchId);
+  clearInterval(session.tick);
+  state.walkingSession = null;
+  if (!save) { render(); return; }
+  if (session.points.length < 2) {
+    toast('Session too short to record. Walk a little further next time.', 'warn');
+    render();
+    return;
+  }
+  try {
+    const res = await api('POST', '/api/activity/sessions', {
+      points: session.points, startTime: session.startedAt, endTime: Date.now(),
+    });
+    state.walkingHistory = [res.session, ...(state.walkingHistory || [])];
+    // The goal panel was rendered before this walk, so refresh its numbers from
+    // the server. Otherwise it keeps showing progress as it was before the walk.
+    state.goalProgress = await api('GET', '/api/activity/goal');
+    toast('Walk saved to your history.');
+  } catch (err) {
+    toast('Unable to save this walk. Please try again.', 'error');
+  }
+  render();
+}
+
+async function loadWalking() {
+  const [res, goal] = await Promise.all([api('GET', '/api/activity/sessions'), api('GET', '/api/activity/goal')]);
+  state.walkingHistory = res.sessions;
+  state.goalProgress = goal;
+}
+
+function bindWalkingEvents() {
+  const goalEdit = document.getElementById('goal-edit');
+  if (goalEdit) goalEdit.onclick = () => { state.modal = { type: 'goal-edit' }; render(); };
+  const goalForm = document.getElementById('goal-form');
+  if (goalForm) goalForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(goalForm);
+    const val = (k) => { const v = fd.get(k); return v === '' ? null : Number(v); };
+    try {
+      state.goalProgress = await api('PUT', '/api/activity/goal', {
+        dailyDistanceMiles: val('dailyDistanceMiles'), dailyWalkMinutes: val('dailyWalkMinutes'),
+      });
+      state.modal = null;
+      toast('Goal saved.');
+      render();
+    } catch (err) { toast(err.message || 'Unable to save goal.', 'error'); }
+  };
+  const start = document.getElementById('walk-start');
+  if (start) start.onclick = startWalkingSession;
+  const stop = document.getElementById('walk-stop');
+  if (stop) stop.onclick = () => stopWalkingSession(true);
+  root.querySelectorAll('[data-walk-delete]').forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api('DELETE', `/api/activity/sessions/${btn.dataset.walkDelete}`);
+        state.walkingHistory = state.walkingHistory.filter((w) => w.id !== btn.dataset.walkDelete);
+        toast('Walk deleted.');
+        render();
+      } catch (err) { toast('Unable to delete this walk.', 'error'); }
+    };
+  });
+}
+
 function securityScreen() {
   const sec = state.security;
   if (!sec) return '';
@@ -1319,9 +1633,14 @@ function settingsScreen() {
           ${state.avatarDataUrl ? `<button type="button" class="link-btn" id="settings-avatar-remove" style="color:var(--danger);">Remove</button>` : ''}
         </div>
       </div>
-      <div class="field"><label>Full Name</label><input value="${state.user.name}" disabled /></div>
-      <div class="field"><label>Email</label><input value="${state.user.email}" disabled /></div>
-      <div class="field-hint">Editing name/email isn't wired up in this reference build — see README's "what's not built out" list.</div>
+      <form id="account-details-form">
+        <div class="field"><label>Full Name</label><input name="name" required maxlength="80" value="${esc(state.user.name)}" /></div>
+        <div class="field"><label>Login Email</label><input name="email" type="email" required maxlength="254" value="${esc(state.user.email)}" /></div>
+        <div class="field"><label>Current Master Password</label><input name="currentPassword" type="password" required autocomplete="current-password" /></div>
+        <div class="field-hint" style="margin-bottom:12px;">Your master password is required to change these, so a stolen session can't change how you sign in.</div>
+        <div id="account-details-error"></div>
+        <button class="btn btn-primary" type="submit">Save changes</button>
+      </form>
     </div>`;
   } else if (tab === 'security') {
     body = `
@@ -1332,6 +1651,13 @@ function settingsScreen() {
         <div class="sec-row"><div class="sec-row-label">${icon('shield',16)} Two-Factor Authentication</div><button class="toggle ${sec.twoFactorEnabled ? 'on' : ''}" id="toggle-2fa-settings"><span class="knob"></span></button></div>
         <div class="sec-row"><div class="sec-row-label">${icon('warn',16)} Duress PIN</div><button class="link-btn" id="open-duress-pin">Set up</button></div>
         <div class="sec-row"><div class="sec-row-label">${icon('bell',16)} Reminder Notifications</div><button class="toggle ${notifPermission() === 'granted' ? 'on' : ''}" id="toggle-notifications"><span class="knob"></span></button></div>
+        <div class="sec-row" style="flex-wrap:wrap;"><div class="sec-row-label">${icon('lock',16)} Notification privacy</div>
+          <select id="notif-privacy" style="padding:6px 8px;border-radius:8px;border:1px solid var(--border);font-size:13px;">
+            <option value="full" ${notifPrivacyLevel() === 'full' ? 'selected' : ''}>Show full details</option>
+            <option value="limited" ${notifPrivacyLevel() === 'limited' ? 'selected' : ''}>Limited (timing only)</option>
+            <option value="hide" ${notifPrivacyLevel() === 'hide' ? 'selected' : ''}>Hide details</option>
+          </select>
+        </div>
         <div style="padding:13px 0;">
           <div style="font-size:13.5px;font-weight:600;margin-bottom:8px;">Auto-Lock After</div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -1342,7 +1668,31 @@ function settingsScreen() {
         <div class="field-hint">Reminder notifications only fire while this tab is open — closed-app delivery needs Web Push, noted as a next step in the README.</div>
       </div>`;
   } else if (tab === 'recovery') {
-    body = `<div class="card" style="padding:20px;max-width:480px;"><div style="font-size:13.5px;font-weight:600;margin-bottom:4px;">Recovery Email</div><div style="font-size:13.5px;color:var(--text-muted);margin-bottom:16px;">${state.user.email}</div><div class="field-hint">Your recovery key was shown once, at account creation. If you no longer have it, generate a new one after unlocking with your master password (not wired up in this reference build — see README).</div></div>`;
+    body = `<div class="card" style="padding:20px;max-width:480px;margin-bottom:16px;">
+      <div style="font-size:14px;font-weight:700;color:var(--navy);margin-bottom:4px;">Emergency contacts</div>
+      <div class="field-hint" style="margin-bottom:12px;">Choose someone who can request access to your vault if something happens to you. You can cancel a request at any time before the waiting period ends.</div>
+      <button class="btn btn-outline btn-block" id="open-emergency-invite" style="margin-bottom:12px;">${icon('plus', 14)} Add an emergency contact</button>
+      <div id="emergency-list">${(state.emergency || []).map((c) => `
+        <div class="sec-row" style="flex-wrap:wrap;">
+          <div><div style="font-size:13.5px;font-weight:600;">${esc(c.contactName)}</div>
+          <div class="field-hint">${esc(c.contactEmail)} · ${c.waitDays}-day wait · ${({invited:'Waiting for a request',requested:'Access requested, waiting period running',released:'Access released',revoked:'Removed'})[c.status] || c.status}</div></div>
+          <div style="display:flex;gap:8px;">
+            ${c.status === 'requested' ? `<button class="link-btn" data-em-veto="${c.id}">Cancel request</button>` : ''}
+            ${c.status !== 'revoked' ? `<button class="link-btn" style="color:var(--danger);" data-em-revoke="${c.id}">Remove</button>` : ''}
+          </div>
+        </div>`).join('') || '<div class="field-hint">No emergency contacts yet.</div>'}</div>
+    </div>`;
+    body += `<div class="card" style="padding:20px;max-width:480px;">
+      <div style="font-size:13.5px;font-weight:600;margin-bottom:4px;">Recovery Email</div>
+      <div style="font-size:13.5px;color:var(--text-muted);margin-bottom:16px;">${esc(state.user.email)}</div>
+      <div style="font-size:13.5px;font-weight:600;margin-bottom:4px;">Recovery Key</div>
+      <div class="field-hint" style="margin-bottom:12px;">Your recovery key lets you get back into your vault if you forget your master password. Creating a new key makes the old one stop working.</div>
+      <form id="regen-recovery-form">
+        <div class="field"><label>Current Master Password</label><input name="currentPassword" type="password" required autocomplete="current-password" /></div>
+        <div id="regen-recovery-error"></div>
+        <button class="btn btn-outline btn-block" type="submit">Create a new recovery key</button>
+      </form>
+    </div>`;
   } else if (tab === 'sessions') {
     body = `<div class="card" style="padding:20px;max-width:520px;">
       ${state.sessions.map((s) => `
@@ -1430,6 +1780,28 @@ function modalHtml() {
   if (m.type === 'reminder-suggestion') return reminderSuggestionModal(m);
   if (m.type === 'item-detail') return itemDetailModal(m);
   if (m.type === 'file-upload') return fileUploadModal(m);
+  if (m.type === 'goal-edit') return goalEditModal();
+  if (m.type === 'emergency-invite') return modalShell('Add an emergency contact', `
+    <form id="emergency-invite-form">
+      <div class="field"><label>Contact name</label><input name="contactName" required maxlength="80" /></div>
+      <div class="field"><label>Contact email</label><input name="contactEmail" type="email" required maxlength="254" /></div>
+      <div class="field"><label>Waiting period before access is released</label>
+        <select name="waitDays"><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option></select>
+      </div>
+      <div class="field-hint" style="margin-bottom:12px;">You'll get a one-time code to give your contact. They need it to request access. It can't be shown again, so keep a note of it until you've passed it on.</div>
+      <div id="emergency-invite-error"></div>
+      <button class="btn btn-primary btn-block" type="submit">Create contact</button>
+    </form>`);
+  if (m.type === 'emergency-secret') return modalShell('Give this code to your contact', `
+    <div class="field-hint" style="margin-bottom:12px;">Share this link with ${esc(m.name)} in person or in a private message. It contains the access code and is shown only once.</div>
+    <div class="recovery-key-box" style="font-size:12px;word-break:break-all;">${esc(location.origin + '/contact.html#id=' + m.id + '&code=' + m.secret)}</div>
+    <button class="btn btn-subtle btn-block" id="emergency-copy" style="margin-bottom:8px;">${ICON.copy} Copy code</button>
+    <button class="btn btn-primary btn-block" id="emergency-done">I have passed it on</button>`);
+  if (m.type === 'recovery-key-shown') return modalShell('Your new recovery key', `
+    <div class="field-hint" style="margin-bottom:12px;">Write this down and keep it somewhere safe. It is shown only once. The old recovery key no longer works.</div>
+    <div class="recovery-key-box">${esc(state.pendingRecoveryKey)}</div>
+    <button class="btn btn-subtle btn-block" id="recovery-copy" style="margin-bottom:8px;">${ICON.copy} Copy key</button>
+    <button class="btn btn-primary btn-block" id="recovery-done">I have saved it</button>`);
   if (m.type === 'share-link') return shareLinkModal(m);
   if (m.type === 'breach-result') return breachResultModal(m);
   if (m.type === 'export-backup') return exportBackupModal();
@@ -1726,17 +2098,93 @@ function reminderSuggestionModal(m) {
 // Calendar / Events
 // ---------------------------------------------------------------------------
 const EVENT_TYPE_META = {
+  personal: { icon: 'note', label: 'Personal' },
   birthday: { icon: 'user', label: 'Birthday' },
-  expiry: { icon: 'clock', label: 'Expiry / Renewal' },
+  appointment: { icon: 'clock', label: 'Appointment' },
   medication: { icon: 'activity', label: 'Medication' },
-  water: { icon: 'droplet', label: 'Water' },
+  water: { icon: 'droplet', label: 'Water Reminder' },
+  payment: { icon: 'key', label: 'Payment' },
+  security: { icon: 'shield', label: 'Security' },
+  task: { icon: 'check', label: 'Task' },
+  custom: { icon: 'idcard', label: 'Custom' },
+  expiry: { icon: 'clock', label: 'Expiry / Renewal' },
   general: { icon: 'note', label: 'Event' },
 };
 
 function calendarScreen() {
-  if (state.calendarView === 'upcoming') return upcomingEventsView();
-  return monthCalendarView();
+  const switcher = `
+    <div class="cal-view-switch">
+      ${[['month','Month'],['week','Week'],['day','Day'],['upcoming','Upcoming'],['completed','Completed']].map(([k, l]) =>
+        `<button class="tab-btn ${state.calendarView === k ? 'active' : ''}" data-cal-view="${k}">${l}</button>`).join('')}
+    </div>`;
+  let body;
+  if (state.calendarView === 'upcoming') body = upcomingEventsView();
+  else if (state.calendarView === 'completed') body = completedEventsView();
+  else if (state.calendarView === 'week') body = weekCalendarView();
+  else if (state.calendarView === 'day') body = dayCalendarView();
+  else body = monthCalendarView();
+  return switcher + body;
 }
+
+function completedEventsView() {
+  const items = state.completedEvents || [];
+  if (items.length === 0) return `<div class="empty-state"><div class="empty-icon">${icon('check', 22)}</div><div>No completed events yet.</div></div>`;
+  return items.map((ev) => `
+    <div class="card item-row" data-event-id="${ev.id}" style="cursor:pointer;">
+      <div class="item-badge">${icon((EVENT_TYPE_META[ev.eventType] || EVENT_TYPE_META.personal).icon, 18)}</div>
+      <div class="item-main">
+        <div class="item-title">${esc(ev.title)}</div>
+        <div class="item-sub">${esc(ev.startDate)}${ev.startTime ? ' · ' + esc(ev.startTime) : ''} · Completed</div>
+      </div>
+    </div>`).join('');
+}
+
+// Week and day views reuse the already-loaded month event range, so
+// navigating between them never needs a new server call.
+function weekCalendarView() {
+  const cursor = state.calendarDay ? parseISODate(state.calendarDay) : new Date();
+  const start = new Date(cursor); start.setDate(cursor.getDate() - cursor.getDay());
+  const days = Array.from({ length: 7 }, (_, i) => { const d = new Date(start); d.setDate(start.getDate() + i); return d; });
+  const todayStr = todayISO();
+  const byDate = {};
+  for (const ev of state.events) (byDate[ev.occurrenceDate] = byDate[ev.occurrenceDate] || []).push(ev);
+  return `
+    <div class="cal-toolbar">
+      <div class="cal-month-label">${days[0].toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} -- ${days[6].toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</div>
+    </div>
+    <div class="cal-week">
+      ${days.map((d) => {
+        const ds = toISO(d);
+        const evs = byDate[ds] || [];
+        return `<div class="cal-week-col ${ds === todayStr ? 'cal-cell-today' : ''}">
+          <div class="cal-week-head">${d.toLocaleDateString(undefined, { weekday: 'short' })} ${d.getDate()}</div>
+          ${evs.length ? evs.map((ev) => `<button class="cal-event-chip" data-event-id="${ev.id}">${esc(ev.title)}</button>`).join('') : '<div class="cal-more">--</div>'}
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+function dayCalendarView() {
+  const d = state.calendarDay ? parseISODate(state.calendarDay) : new Date();
+  const ds = toISO(d);
+  const evs = (state.events || []).filter((ev) => ev.occurrenceDate === ds);
+  return `
+    <div class="cal-toolbar">
+      <div class="cal-month-label">${d.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}</div>
+    </div>
+    ${evs.length === 0 ? `<div class="empty-state"><div class="empty-icon">${icon('clock', 22)}</div><div>No events on this day.</div></div>`
+      : evs.map((ev) => `
+        <div class="card item-row" data-event-id="${ev.id}" style="cursor:pointer;">
+          <div class="item-badge">${icon((EVENT_TYPE_META[ev.eventType] || EVENT_TYPE_META.personal).icon, 18)}</div>
+          <div class="item-main">
+            <div class="item-title">${esc(ev.title)}</div>
+            <div class="item-sub">${ev.startTime ? esc(ev.startTime) : 'All day'}${ev.recurrence !== 'none' ? ' · Repeats' : ''}</div>
+          </div>
+        </div>`).join('')}`;
+}
+
+function parseISODate(s) { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); }
+function toISO(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
 
 function monthCalendarView() {
   const { year, month } = state.calendarCursor;
@@ -1783,12 +2231,17 @@ function upcomingEventsView() {
   return `
     <div class="cal-toolbar">
       <div style="font-weight:700;color:var(--navy);font-size:15px;">Upcoming</div>
-      <div style="display:flex;gap:8px;">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <label style="font-size:12.5px;color:var(--text-muted);">Show next
+          <select id="upcoming-window" style="margin-left:6px;padding:6px 8px;border-radius:8px;border:1px solid var(--border);font-size:13px;">
+            ${UPCOMING_WINDOW_OPTIONS.map(([d, l]) => `<option value="${d}" ${upcomingWindowDays() === d ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+        </label>
         <button class="tab-btn" data-cal-view="month">Month View</button>
         <button class="btn btn-primary btn-sm" id="cal-add-event">${icon('plus', 14)} Add Event</button>
       </div>
     </div>
-    ${items.length === 0 ? `<div class="empty-state"><div class="empty-icon">${icon('clock', 22)}</div><div>Nothing coming up in the next 60 days.</div></div>` : items.map((ev) => upcomingEventRow(ev)).join('')}`;
+    ${items.length === 0 ? `<div class="empty-state"><div class="empty-icon">${icon('clock', 22)}</div><div>Nothing coming up in the next ${upcomingWindowDays()} days.</div></div>` : items.map((ev) => upcomingEventRow(ev)).join('')}`;
 }
 
 function upcomingEventRow(ev) {
@@ -1809,55 +2262,102 @@ function todayISO() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+const REMINDER_OPTIONS = [
+  [0, 'At event time'], [5, '5 minutes before'], [15, '15 minutes before'], [30, '30 minutes before'],
+  [60, '1 hour before'], [120, '2 hours before'], [1440, '1 day before'], [10080, '1 week before'],
+];
+const EVENT_TYPE_ORDER = ['personal', 'birthday', 'appointment', 'medication', 'water', 'payment', 'security', 'task', 'custom'];
+const REPEAT_OPTIONS = [['none', 'Does not repeat'], ['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['annually', 'Yearly']];
+
 function eventModal(m) {
   const ev = m.event;
+  const selectedReminders = new Set((ev?.reminders || []).map((r) => r.minutesBefore));
   return modalShell(ev ? 'Edit Event' : 'New Event', `
     <form id="event-form">
-      <div class="field"><label>Title</label><input name="title" required value="${esc(ev?.title || '')}" placeholder="e.g. Project Submission" /></div>
+      <div class="field"><label>Event Title</label><input name="title" required value="${esc(ev?.title || '')}" placeholder="e.g. Doctor Appointment" /></div>
+      <div class="field"><label>Event Type</label>
+        <select name="eventType">
+          ${EVENT_TYPE_ORDER.map((k) => `<option value="${k}" ${(ev?.eventType || 'personal') === k ? 'selected' : ''}>${EVENT_TYPE_META[k].label}</option>`).join('')}
+        </select>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
         <div class="field"><label>Date</label><input name="startDate" type="date" required value="${ev?.startDate || todayISO()}" /></div>
-        <div class="field"><label>Time (optional)</label><input name="startTime" type="time" value="${ev?.startTime || ''}" /></div>
+        <div class="field"><label>Time</label><input name="startTime" type="time" value="${ev?.startTime || ''}" /></div>
       </div>
-      <div class="field"><label>Category</label>
-        <select name="eventType">
-          ${Object.entries(EVENT_TYPE_META).map(([k, v]) => `<option value="${k}" ${ev?.eventType === k ? 'selected' : ''}>${v.label}</option>`).join('')}
-        </select>
+      <div class="field"><label>Location (optional)</label><input name="location" value="${esc(ev?.location || '')}" placeholder="Optional" /></div>
+      <div class="field"><label>Notes (optional)</label><textarea name="description" rows="2" placeholder="Optional">${esc(ev?.description || '')}</textarea></div>
+      <div class="field"><label>Reminders</label>
+        <div class="reminder-grid">
+          ${REMINDER_OPTIONS.map(([mins, label]) => `
+            <label class="reminder-chip ${selectedReminders.has(mins) ? 'on' : ''}">
+              <input type="checkbox" name="reminder" value="${mins}" ${selectedReminders.has(mins) ? 'checked' : ''} />${esc(label)}
+            </label>`).join('')}
+        </div>
+        <div class="field-hint">Pick any combination. Each one fires at its own time before the event.</div>
       </div>
       <div class="field"><label>Repeat</label>
         <select name="recurrence">
-          ${[['none','Does not repeat'],['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['annually','Annually']].map(([k,l]) => `<option value="${k}" ${ev?.recurrence === k ? 'selected' : ''}>${l}</option>`).join('')}
+          ${REPEAT_OPTIONS.map(([k, l]) => `<option value="${k}" ${(ev?.recurrence || 'none') === k ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
       </div>
-      <div class="field"><label>Location (optional)</label><input name="location" value="${esc(ev?.location || '')}" /></div>
-      <div class="field"><label>Description (optional)</label><textarea name="description" rows="2">${esc(ev?.description || '')}</textarea></div>
-      <button class="btn btn-primary btn-block" type="submit">${ev ? 'Save Changes' : 'Create Event'}</button>
-      ${ev ? `<button type="button" class="btn btn-danger btn-block" id="delete-event-btn" style="margin-top:8px;">${ICON.trash} Delete Event</button>` : ''}
+      <button class="btn btn-primary btn-block" type="submit">${ev ? 'Save Changes' : 'Save Event'}</button>
+      ${ev ? `
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-subtle btn-sm" id="event-toggle-complete" style="flex:1;">${ev.completed ? 'Reopen' : 'Mark as completed'}</button>
+          <button type="button" class="btn btn-subtle btn-sm" id="event-duplicate" style="flex:1;">${icon('copy', 13)} Duplicate</button>
+          <button type="button" class="btn btn-danger btn-sm" id="delete-event-btn" style="flex:1;">${ICON.trash} Delete</button>
+        </div>` : ''}
     </form>`);
 }
 
 function bindEventFormEvents() {
   const form = document.getElementById('event-form');
-  if (form) form.onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(form);
-    const data = {
-      title: fd.get('title'), startDate: fd.get('startDate'), startTime: fd.get('startTime') || null,
-      eventType: fd.get('eventType'), recurrence: fd.get('recurrence'), location: fd.get('location') || null,
-      description: fd.get('description') || null,
+  if (form) {
+    form.querySelectorAll('.reminder-chip input').forEach((cb) => {
+      cb.onchange = () => cb.closest('.reminder-chip').classList.toggle('on', cb.checked);
+    });
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      const reminders = fd.getAll('reminder').map((v) => ({ minutesBefore: Number(v) }));
+      const data = {
+        title: fd.get('title'), startDate: fd.get('startDate'), startTime: fd.get('startTime') || null,
+        eventType: fd.get('eventType'), recurrence: fd.get('recurrence'), location: fd.get('location') || null,
+        description: fd.get('description') || null, reminders,
+      };
+      try {
+        if (state.modal.event) await api('PUT', `/api/events/${state.modal.event.id}`, data);
+        else await api('POST', '/api/events', data);
+        toast(state.modal.event ? 'Changes saved successfully.' : 'Event saved.');
+        state.modal = null;
+        await navigate('calendar');
+      } catch (err) { toast('Unable to save changes. Please try again.', 'error'); }
     };
-    try {
-      if (state.modal.event) await api('PUT', `/api/events/${state.modal.event.id}`, data);
-      else await api('POST', '/api/events', data);
-      toast('Saved');
-      state.modal = null;
-      await navigate('calendar');
-    } catch (err) { toast(err.message, 'error'); }
-  };
+  }
   const deleteBtn = document.getElementById('delete-event-btn');
   if (deleteBtn) deleteBtn.onclick = async () => {
     try {
       await api('DELETE', `/api/events/${state.modal.event.id}`);
       toast('Event deleted');
+      state.modal = null;
+      await navigate('calendar');
+    } catch (err) { toast(err.message, 'error'); }
+  };
+  const completeBtn = document.getElementById('event-toggle-complete');
+  if (completeBtn) completeBtn.onclick = async () => {
+    try {
+      const ev = state.modal.event;
+      await api('POST', `/api/events/${ev.id}/complete`, { completed: !ev.completed });
+      toast(ev.completed ? 'Event reopened' : 'Marked as completed');
+      state.modal = null;
+      await navigate('calendar');
+    } catch (err) { toast(err.message, 'error'); }
+  };
+  const dupBtn = document.getElementById('event-duplicate');
+  if (dupBtn) dupBtn.onclick = async () => {
+    try {
+      await api('POST', `/api/events/${state.modal.event.id}/duplicate`, {});
+      toast('Event duplicated');
       state.modal = null;
       await navigate('calendar');
     } catch (err) { toast(err.message, 'error'); }
@@ -2227,6 +2727,7 @@ function bindAppEvents() {
   bindDocumentsEvents();
   bindCustomItemsEvents();
   bindCalendarEvents();
+  bindWalkingEvents();
   bindSecurityEvents();
   bindSettingsEvents();
 }
@@ -2451,6 +2952,17 @@ function bindCalendarEvents() {
   root.querySelectorAll('[data-cal-view]').forEach((btn) => {
     btn.onclick = async () => { state.calendarView = btn.dataset.calView; await loadCalendar(); render(); };
   });
+  const windowSel = document.getElementById('upcoming-window');
+  if (windowSel) windowSel.onchange = async () => {
+    try {
+      await setUpcomingWindowDays(Number(windowSel.value));
+      await loadCalendar();
+      render();
+    } catch (err) {
+      toast('Could not save your calendar preference. Please try again.', 'error');
+      render();
+    }
+  };
   const addBtn = document.getElementById('cal-add-event');
   if (addBtn) addBtn.onclick = () => { state.modal = { type: 'add-event' }; render(); };
   root.querySelectorAll('[data-event-id]').forEach((el) => {
@@ -2497,13 +3009,19 @@ function bindSettingsEvents() {
   root.querySelectorAll('[data-settings-tab]').forEach((btn) => { btn.onclick = () => { state.settingsTab = btn.dataset.settingsTab; render(); }; });
   const openCP = document.getElementById('open-change-password'); if (openCP) openCP.onclick = () => { state.modal = { type: 'change-password' }; render(); };
   const openPin = document.getElementById('open-change-pin'); if (openPin) openPin.onclick = () => { state.modal = { type: 'change-pin' }; render(); };
+  const privacySel = document.getElementById('notif-privacy');
+  if (privacySel) privacySel.onchange = () => { setNotifPrivacyLevel(privacySel.value); toast('Notification privacy updated.'); };
   const toggleNotif = document.getElementById('toggle-notifications');
   if (toggleNotif) toggleNotif.onclick = async () => {
     if (typeof Notification === 'undefined') { toast('Notifications are not supported in this browser.', 'warn'); return; }
     if (Notification.permission === 'granted') { toast('To turn notifications off, use your browser\'s site settings.', 'warn'); return; }
-    const perm = await Notification.requestPermission();
-    if (perm === 'granted') { toast('Reminder notifications enabled'); startReminderPolling(); }
-    else toast('Notifications permission was not granted.', 'warn');
+    try {
+      await enableClosedAppNotifications();
+      toast('Notifications enabled on this device.');
+      startReminderPolling();
+    } catch (err) {
+      toast(err.message || 'Could not enable notifications.', 'warn');
+    }
     render();
   };
   const toggleBio = document.getElementById('toggle-biometric');
@@ -2547,6 +3065,65 @@ function bindSettingsEvents() {
     if (outcome === 'accepted') toast('Installing…'); else render();
   };
 
+  const recDone = document.getElementById('recovery-done');
+  if (recDone) recDone.onclick = () => { state.pendingRecoveryKey = null; state.modal = null; render(); };
+  const recCopy = document.getElementById('recovery-copy');
+  if (recCopy) recCopy.onclick = () => { navigator.clipboard?.writeText(state.pendingRecoveryKey || ''); toast('Recovery key copied.'); };
+  const regenForm = document.getElementById('regen-recovery-form');
+  if (regenForm) regenForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(regenForm);
+    try {
+      const res = await api('POST', '/api/auth/recovery-key/regenerate', { currentPassword: fd.get('currentPassword') });
+      state.pendingRecoveryKey = res.recoveryKey;
+      state.modal = { type: 'recovery-key-shown' };
+      render();
+    } catch (err) {
+      document.getElementById('regen-recovery-error').innerHTML = `<div class="error-banner">${esc(err.message)}</div>`;
+    }
+  };
+  const openInvite = document.getElementById('open-emergency-invite');
+  if (openInvite) openInvite.onclick = () => { state.modal = { type: 'emergency-invite' }; render(); };
+  const inviteForm = document.getElementById('emergency-invite-form');
+  if (inviteForm) inviteForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(inviteForm);
+    try {
+      const res = await api('POST', '/api/emergency', { contactName: fd.get('contactName'), contactEmail: fd.get('contactEmail'), waitDays: Number(fd.get('waitDays')) });
+      state.modal = { type: 'emergency-secret', name: res.contact.contactName, secret: res.secret, id: res.contact.id };
+      state.emergency = [res.contact, ...(state.emergency || [])];
+      render();
+    } catch (err) {
+      document.getElementById('emergency-invite-error').innerHTML = `<div class="error-banner">${esc(err.message)}</div>`;
+    }
+  };
+  const emDone = document.getElementById('emergency-done');
+  if (emDone) emDone.onclick = () => { state.modal = null; render(); };
+  const emCopy = document.getElementById('emergency-copy');
+  if (emCopy) emCopy.onclick = () => { navigator.clipboard?.writeText(location.origin + '/contact.html#id=' + state.modal?.id + '&code=' + (state.modal?.secret || '')); toast('Link copied.'); };
+  root.querySelectorAll('[data-em-veto]').forEach((b) => b.onclick = async () => {
+    try { await api('POST', `/api/emergency/${b.dataset.emVeto}/veto`, {}); toast('Request cancelled.'); await loadSecurity(); render(); }
+    catch (err) { toast(err.message, 'error'); }
+  });
+  root.querySelectorAll('[data-em-revoke]').forEach((b) => b.onclick = async () => {
+    try { await api('POST', `/api/emergency/${b.dataset.emRevoke}/revoke`, {}); toast('Contact removed.'); await loadSecurity(); render(); }
+    catch (err) { toast(err.message, 'error'); }
+  });
+  const accountForm = document.getElementById('account-details-form');
+  if (accountForm) accountForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(accountForm);
+    try {
+      const res = await api('PUT', '/api/auth/account-details', {
+        name: fd.get('name'), email: fd.get('email'), currentPassword: fd.get('currentPassword'),
+      });
+      state.user = { ...state.user, ...res.user };
+      toast('Account details updated.');
+      render();
+    } catch (err) {
+      document.getElementById('account-details-error').innerHTML = `<div class="error-banner">${esc(err.message)}</div>`;
+    }
+  };
   const openDuress = document.getElementById('open-duress-pin');
   if (openDuress) openDuress.onclick = () => { state.modal = { type: 'duress-pin' }; render(); };
   const openExport = document.getElementById('open-export-backup');
