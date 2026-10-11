@@ -67,6 +67,7 @@ function rowToSession(row) {
     startTime: row.start_time,
     endTime: row.end_time,
     durationSeconds: row.duration_seconds,
+    sessionSeconds: row.session_seconds ?? null,
     distanceMeters: row.distance_meters,
     distanceMiles: row.distance_meters / 1609.344,
     avgSpeedMph: row.duration_seconds > 0 ? (row.distance_meters / 1609.344) / (row.duration_seconds / 3600) : 0,

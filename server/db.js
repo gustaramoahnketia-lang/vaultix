@@ -195,6 +195,16 @@ CREATE TABLE IF NOT EXISTS walking_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_walking_user_time ON walking_sessions(user_id, start_time);
 
+-- The one walk in progress for an account. The session clock lives here, so it
+-- survives closing or minimizing the app. state holds the classifier's values.
+CREATE TABLE IF NOT EXISTS active_walks (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  started_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  state TEXT NOT NULL
+);
+
 -- Account-level preferences (one row per user). Stored server-side so a
 -- preference follows the account to every device, instead of living in one
 -- browser's localStorage. Only fields the server validates are accepted.
@@ -282,7 +292,10 @@ CREATE INDEX IF NOT EXISTS idx_events_user ON security_events(user_id, created_a
 `;
 
 db.exec(SCHEMA);
+// Migration for databases created before session time was recorded separately.
+// Adding a column that already exists throws, which is expected and ignored.
+try { db.exec('ALTER TABLE walking_sessions ADD COLUMN session_seconds INTEGER'); } catch { /* already present */ }
 
 export function resetDatabaseForTests() {
-  db.exec('DELETE FROM shares; DELETE FROM events; DELETE FROM walking_sessions; DELETE FROM activity_goals; DELETE FROM user_preferences; DELETE FROM emergency_access; DELETE FROM push_subscriptions; DELETE FROM reminder_deliveries; DELETE FROM vault_files; DELETE FROM security_events; DELETE FROM vault_items; DELETE FROM sessions; DELETE FROM users;');
+  db.exec('DELETE FROM shares; DELETE FROM events; DELETE FROM walking_sessions; DELETE FROM active_walks; DELETE FROM activity_goals; DELETE FROM user_preferences; DELETE FROM emergency_access; DELETE FROM push_subscriptions; DELETE FROM reminder_deliveries; DELETE FROM vault_files; DELETE FROM security_events; DELETE FROM vault_items; DELETE FROM sessions; DELETE FROM users;');
 }

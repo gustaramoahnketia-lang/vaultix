@@ -19,6 +19,7 @@ import * as Activity from './activity.js';
 import * as Prefs from './preferences.js';
 import * as Push from './push.js';
 import * as Emergency from './emergency.js';
+import * as ActiveWalk from './active-walk.js';
 import { Router, httpErr, sendJson } from './http-utils.js';
 
 export const router = new Router();
@@ -598,6 +599,28 @@ router.put('/api/preferences/upcoming-window', authGuard, csrfGuard, async (req,
   const prefs = Prefs.setUpcomingWindow(req.user.id, req.body?.days);
   logEvent(req.user.id, 'Calendar preference updated');
   sendJson(res, 200, prefs);
+});
+
+// Active walk: survives closing or minimizing the app. See server/active-walk.js.
+router.get('/api/activity/active', authGuard, async (req, res) => {
+  sendJson(res, 200, { active: ActiveWalk.getActive(req.user.id) });
+});
+
+router.post('/api/activity/active/start', authGuard, csrfGuard, async (req, res) => {
+  const result = ActiveWalk.startOrResume(req.user.id);
+  if (!result.resumed) logEvent(req.user.id, 'Walk started');
+  sendJson(res, result.resumed ? 200 : 201, result);
+});
+
+router.post('/api/activity/active/samples', authGuard, csrfGuard, async (req, res) => {
+  const active = ActiveWalk.addSamples(req.user.id, req.body?.samples);
+  sendJson(res, 200, { active });
+});
+
+router.post('/api/activity/active/stop', authGuard, csrfGuard, async (req, res) => {
+  const sessionId = ActiveWalk.stop(req.user.id);
+  logEvent(req.user.id, 'Walk stopped');
+  sendJson(res, 200, { session: Activity.getSession(req.user.id, sessionId) });
 });
 
 router.get('/api/activity/goal', authGuard, async (req, res) => {

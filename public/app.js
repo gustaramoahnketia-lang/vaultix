@@ -42,6 +42,7 @@ const state = {
   calendarView: 'month', // 'month' | 'upcoming'
   walkingSession: null, // { startedAt, points, watchId, tick } while a GPS walk is active -- in memory only
   walkingHistory: [],
+  walkingServer: null, // the server's view of the active walk: { id, startedAt, elapsedSeconds, movingSeconds, distanceMiles, status, fetchedAt }
   calendarCursor: null, // {year, month} — set on first load
   activity: [],
   chainStatus: null,
@@ -1368,38 +1369,46 @@ function goalEditModal() {
 }
 
 function walkingScreen() {
-  const active = state.walkingSession;
+  const srv = state.walkingServer;
   const hist = state.walkingHistory || [];
   const geoSupported = 'geolocation' in navigator;
+  const tracking = isWalkTracking();
   return `
     ${goalPanelHtml()}
     <div class="card" style="padding:20px;margin-bottom:16px;">
-      <div style="font-weight:700;color:var(--navy);font-size:15px;margin-bottom:6px;">Walking session</div>
+      <div style="font-weight:700;color:var(--navy);font-size:15px;margin-bottom:6px;">Walk</div>
       <div class="field-hint" style="margin-bottom:14px;">
-        Records your route using your device's location while the session is running. Location is only read while a session is open, and it stops the moment you press Stop. Battery use is higher during a session.
+        Your walk keeps going if you close or minimize the app. Movement is recorded only while the app is open or running in the background on this device. If the app is fully closed, the session clock keeps running, but movement isn't recorded until you open the app again.
       </div>
-      ${!geoSupported ? `<div class="warn-banner">This browser doesn't support location, so walking sessions aren't available here.</div>` : ''}
-      ${active ? `
-        <div class="rec-tip success" style="margin-bottom:12px;">${icon('lock', 14)} Walking session active -- location is being recorded.</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
-          <div><div class="stat-label">Elapsed</div><div class="stat-value" id="walk-elapsed">0:00</div></div>
-          <div><div class="stat-label">Distance</div><div class="stat-value" id="walk-distance">0.00 mi</div></div>
+      ${!geoSupported ? `<div class="warn-banner">This browser doesn't support location, so walks can't record movement here.</div>` : ''}
+      ${srv ? `
+        <div class="rec-tip ${tracking ? 'success' : 'warn'}" style="margin-bottom:12px;">
+          ${tracking ? 'Recording movement.' : 'A walk is running, but movement isn\'t being recorded right now. Tap Resume tracking to continue.'}
         </div>
-        <button class="btn btn-danger btn-block" id="walk-stop">Stop session</button>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+          <div><div class="stat-label">Session time</div><div class="stat-value" id="walk-session-time">${fmtDuration(walkLiveSeconds())}</div></div>
+          <div><div class="stat-label">Walking time</div><div class="stat-value" id="walk-moving-time">${fmtDuration(srv.movingSeconds)}</div></div>
+          <div><div class="stat-label">Distance</div><div class="stat-value" id="walk-distance">${srv.distanceMiles.toFixed(2)} mi</div></div>
+          <div><div class="stat-label">Now</div><div class="stat-value" id="walk-status" style="font-size:16px;">${srv.status === 'moving' ? 'Moving' : 'Standing still'}</div></div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          ${tracking ? '' : `<button class="btn btn-outline" id="walk-resume" style="flex:1;" ${geoSupported ? '' : 'disabled'}>Resume tracking</button>`}
+          <button class="btn btn-danger" id="walk-stop" style="flex:1;">Finish walk</button>
+        </div>
       ` : `
-        <button class="btn btn-primary btn-block" id="walk-start" ${geoSupported ? '' : 'disabled'}>${icon('activity', 15)} Start walking session</button>
+        <button class="btn btn-primary btn-block" id="walk-start" ${geoSupported ? '' : 'disabled'}>${icon('activity', 15)} Start walk</button>
       `}
     </div>
     <div style="font-weight:700;color:var(--navy);font-size:14px;margin:6px 0 10px;">History</div>
-    ${hist.length === 0 ? `<div class="empty-state"><div class="empty-icon">${icon('activity', 22)}</div><div>No walking sessions recorded yet.</div></div>`
+    ${hist.length === 0 ? `<div class="empty-state"><div class="empty-icon">${icon('activity', 22)}</div><div>No walks recorded yet.</div></div>`
       : hist.map((w) => `
         <div class="card item-row">
           <div class="item-badge">${icon('activity', 18)}</div>
           <div class="item-main">
             <div class="item-title">${w.distanceMiles.toFixed(2)} mi walked</div>
-            <div class="item-sub">${new Date(w.startTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · ${fmtDuration(w.durationSeconds)} · ${w.avgSpeedMph.toFixed(1)} mph</div>
+            <div class="item-sub">${new Date(w.startTime).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · walking ${fmtDuration(w.durationSeconds)}${w.sessionSeconds ? ` of ${fmtDuration(w.sessionSeconds)} session` : ''}</div>
           </div>
-          <button class="icon-btn" data-walk-delete="${w.id}" title="Delete session">${ICON.trash}</button>
+          <button class="icon-btn" data-walk-delete="${w.id}" title="Delete walk">${ICON.trash}</button>
         </div>`).join('')}
     <div class="field-hint" style="margin-top:14px;">Step counts and daily sensor totals aren't available in a web browser. They need the native iPhone or Android app, which reads the phone's own health data.</div>`;
 }
@@ -1416,76 +1425,163 @@ function haversineMiles(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-function startWalkingSession() {
-  if (!('geolocation' in navigator)) { toast('Location is not available on this device.', 'error'); return; }
-  const session = { startedAt: Date.now(), points: [], watchId: null, lastSampleAt: 0, tick: null };
-  session.watchId = navigator.geolocation.watchPosition(
+const WALK_FLUSH_MS = 15000;   // send collected samples to the server every 15 seconds
+const WALK_MAX_BUFFER = 500;   // keep at most this many unsent samples; the oldest are dropped first
+
+function setWalkServer(view) {
+  if (!view) { state.walkingServer = null; return; }
+  state.walkingServer = { ...view, fetchedAt: Date.now() };
+}
+function walkLiveSeconds() {
+  const srv = state.walkingServer;
+  if (!srv) return 0;
+  return srv.elapsedSeconds + (Date.now() - srv.fetchedAt) / 1000;
+}
+function isWalkTracking() {
+  return !!(state.walkingSession && state.walkingSession.watchId !== null);
+}
+
+function updateWalkLive() {
+  const srv = state.walkingServer;
+  if (!srv) return;
+  const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  set('walk-session-time', fmtDuration(walkLiveSeconds()));
+  set('walk-moving-time', fmtDuration(srv.movingSeconds));
+  set('walk-distance', `${srv.distanceMiles.toFixed(2)} mi`);
+  set('walk-status', srv.status === 'moving' ? 'Moving' : 'Standing still');
+}
+
+let walkWakeLock = null;
+async function requestWakeLock() {
+  try { if ('wakeLock' in navigator) walkWakeLock = await navigator.wakeLock.request('screen'); } catch { /* not supported or refused: fine */ }
+}
+function releaseWakeLock() {
+  try { walkWakeLock?.release(); } catch { /* already released */ }
+  walkWakeLock = null;
+}
+
+// Starts recording location on this device. The walk itself is already on the
+// server; this only collects samples and sends them.
+function beginTracking() {
+  if (isWalkTracking() || !('geolocation' in navigator)) return;
+  const sess = { buffer: [], lastSampleAt: 0, watchId: null, flushTimer: null, flushing: false };
+  state.walkingSession = sess;
+  sess.watchId = navigator.geolocation.watchPosition(
     (pos) => {
       const now = Date.now();
-      if (session.points.length && now - session.lastSampleAt < WALK_SAMPLE_MIN_INTERVAL_MS) return;
-      if (session.points.length >= WALK_MAX_POINTS) return;
-      session.lastSampleAt = now;
-      session.points.push([pos.coords.latitude, pos.coords.longitude, now]);
-      updateWalkingLiveStats(session);
+      if (now - sess.lastSampleAt < WALK_SAMPLE_MIN_INTERVAL_MS) return;
+      sess.lastSampleAt = now;
+      if (sess.buffer.length >= WALK_MAX_BUFFER) sess.buffer.shift();
+      sess.buffer.push([pos.coords.latitude, pos.coords.longitude, now]);
     },
     (err) => {
-      if (err.code === 1) { toast('Location permission was denied. Enable it in your browser settings to record walks.', 'error'); stopWalkingSession(false); }
-      else toast('Could not get a location fix. Make sure location services are on.', 'warn');
+      if (err.code === 1) {
+        toast('Location permission is off. Allow it in your browser settings to record movement.', 'error');
+        endTrackingOnly();
+        render();
+      }
     },
     { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 }
   );
-  state.walkingSession = session;
-  session.tick = setInterval(() => updateWalkingLiveStats(session), 1000);
-  render();
+  sess.flushTimer = setInterval(flushWalk, WALK_FLUSH_MS);
+  requestWakeLock();
 }
 
-function updateWalkingLiveStats(session) {
-  const el = document.getElementById('walk-elapsed');
-  const dist = document.getElementById('walk-distance');
-  if (el) el.textContent = fmtDuration((Date.now() - session.startedAt) / 1000);
-  if (dist) {
-    let miles = 0;
-    for (let i = 1; i < session.points.length; i++) {
-      const [a, b, t1] = session.points[i - 1], [c, d, t2] = session.points[i];
-      const seg = haversineMiles(a, b, c, d);
-      if (seg / Math.max(1 / 3600, (t2 - t1) / 3600000) <= 33) miles += seg; // same jitter guard as the server
+function endTrackingOnly() {
+  const sess = state.walkingSession;
+  if (sess) {
+    if (sess.watchId !== null) navigator.geolocation.clearWatch(sess.watchId);
+    clearInterval(sess.flushTimer);
+  }
+  state.walkingSession = null;
+  releaseWakeLock();
+}
+
+async function flushWalk() {
+  const sess = state.walkingSession;
+  if (!sess || sess.flushing || sess.buffer.length === 0) return;
+  sess.flushing = true;
+  const batch = sess.buffer.slice(0, 200);
+  try {
+    const res = await api('POST', '/api/activity/active/samples', { samples: batch });
+    sess.buffer.splice(0, batch.length);
+    setWalkServer(res.active);
+    updateWalkLive();
+  } catch (err) {
+    if (err.status === 404 || err.status === 409) {
+      // The server no longer has this walk (it was finished elsewhere or hit the 12-hour limit).
+      endTrackingOnly();
+      await loadWalking();
+      render();
+      toast('This walk was already saved on the server.', 'warn');
+    } else if (err.status === 400) {
+      // The server refused this batch as invalid. Drop it so it doesn't retry forever.
+      sess.buffer.splice(0, batch.length);
     }
-    dist.textContent = `${miles.toFixed(2)} mi`;
+    // Any other error (for example, offline): keep the samples and retry on the next flush.
+  } finally {
+    sess.flushing = false;
   }
 }
 
-async function stopWalkingSession(save = true) {
-  const session = state.walkingSession;
-  if (!session) return;
-  if (session.watchId !== null) navigator.geolocation.clearWatch(session.watchId);
-  clearInterval(session.tick);
-  state.walkingSession = null;
-  if (!save) { render(); return; }
-  if (session.points.length < 2) {
-    toast('Session too short to record. Walk a little further next time.', 'warn');
-    render();
+async function startWalkingSession() {
+  if (!('geolocation' in navigator)) { toast('Location is not available on this device.', 'error'); return; }
+  try {
+    const res = await api('POST', '/api/activity/active/start', {});
+    setWalkServer(res.active);
+  } catch (err) {
+    toast('Could not start the walk. Please try again.', 'error');
     return;
   }
+  beginTracking();
+  render();
+}
+
+async function stopWalkingSession() {
+  const sess = state.walkingSession;
+  if (sess) {
+    while (sess.flushing) await new Promise((r) => setTimeout(r, 100));
+    await flushWalk();
+  }
+  endTrackingOnly();
   try {
-    const res = await api('POST', '/api/activity/sessions', {
-      points: session.points, startTime: session.startedAt, endTime: Date.now(),
-    });
+    const res = await api('POST', '/api/activity/active/stop', {});
+    state.walkingServer = null;
     state.walkingHistory = [res.session, ...(state.walkingHistory || [])];
-    // The goal panel was rendered before this walk, so refresh its numbers from
-    // the server. Otherwise it keeps showing progress as it was before the walk.
-    state.goalProgress = await api('GET', '/api/activity/goal');
     toast('Walk saved to your history.');
   } catch (err) {
-    toast('Unable to save this walk. Please try again.', 'error');
+    toast('Could not finish the walk. Please try again.', 'error');
+    await loadWalking();
   }
   render();
 }
 
+// Runs on every visit to the Walking screen. The server is the source of truth,
+// so a walk started before the app was closed comes back here.
 async function loadWalking() {
-  const [res, goal] = await Promise.all([api('GET', '/api/activity/sessions'), api('GET', '/api/activity/goal')]);
+  const [res, goal, active] = await Promise.all([
+    api('GET', '/api/activity/sessions'),
+    api('GET', '/api/activity/goal'),
+    api('GET', '/api/activity/active'),
+  ]);
   state.walkingHistory = res.sessions;
   state.goalProgress = goal;
+  if (active.active) {
+    setWalkServer(active.active);
+    beginTracking();
+  } else {
+    state.walkingServer = null;
+    endTrackingOnly();
+  }
 }
+
+// Keep the live readout ticking, and recover tracking when the app comes back.
+setInterval(() => { if (state.screen === 'app' && state.active === 'walking') updateWalkLive(); }, 1000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  if (state.screen === 'app' && state.walkingServer && !isWalkTracking()) { beginTracking(); render(); }
+  if (isWalkTracking()) requestWakeLock();
+});
 
 function bindWalkingEvents() {
   const goalEdit = document.getElementById('goal-edit');
@@ -1506,8 +1602,10 @@ function bindWalkingEvents() {
   };
   const start = document.getElementById('walk-start');
   if (start) start.onclick = startWalkingSession;
+  const resume = document.getElementById('walk-resume');
+  if (resume) resume.onclick = () => { beginTracking(); render(); };
   const stop = document.getElementById('walk-stop');
-  if (stop) stop.onclick = () => stopWalkingSession(true);
+  if (stop) stop.onclick = stopWalkingSession;
   root.querySelectorAll('[data-walk-delete]').forEach((btn) => {
     btn.onclick = async () => {
       try {

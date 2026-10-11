@@ -955,3 +955,54 @@ passkey, which is covered under the deferred WebAuthn work in section 15.
 
 - The zip does not contain a database, so the app starts empty. Accounts are created on your own machine.
 - The zip does not contain `node_modules`. The project has no npm dependencies, so none are needed. Only the optional `web-push` step (item 1) installs a package.
+
+## 23. Walks that keep running (session continuity)
+
+### What changed
+
+The walk used to live only in the browser, so closing or minimizing the app lost
+it. Now the walk lives on the server:
+
+- **Session time** is kept by the server. It keeps counting while the app is closed.
+- **Walking time** is the time the classifier judged you to be moving, from GPS
+  samples the app sent. Standing still does not count, and neither does a gap with
+  no samples.
+- **Resume.** Opening the app again returns to the walk in progress. Tracking
+  restarts automatically if the browser still has location permission. Otherwise
+  the screen offers "Resume tracking".
+- **12-hour limit.** A walk that runs longer is saved automatically at 12 hours.
+
+### How movement is decided (`server/active-walk.js`)
+
+- Moving: you leave a 10 m radius around your last still point.
+- Standing still: you stay inside that radius for 30 seconds.
+- A gap with no samples longer than 60 seconds earns no moving time.
+- A jump faster than 10 m/s is treated as GPS error and not counted.
+- Samples out of order or duplicated are ignored, so time never counts backwards.
+
+### What a web page can and cannot do
+
+- **Closed app:** the clock keeps running on the server, but movement is not
+  recorded until the app is open again. A browser cannot read location while it is
+  fully closed.
+- **Minimized:** tracking continues on desktop browsers. On phones, the operating
+  system may pause location for background apps. This has not been tested on a
+  phone.
+- **Steps:** not available in a browser (see section 22).
+
+### Verified
+
+- 16 classifier and API tests (`tests/active-walk.test.js`): standing still earns
+  nothing, steady walking counts with about the right distance, a closed-app gap
+  earns nothing, GPS jumps and out-of-order samples are ignored, resume returns the
+  same walk, one active walk per account, other accounts are refused, and the 12-hour
+  limit ends a walk. Breaking the standing rule makes two of these fail.
+- A real browser run: stand still, walk, close the app, reopen. The clock kept
+  running (83 s became 93 s), the walk resumed, and finishing it saved walking time
+  and session time separately.
+
+### Not verified
+
+- Phone background behaviour (iOS and Android both limit location for background
+  web apps).
+- Real-world GPS accuracy outdoors. The browser test used simulated positions.
