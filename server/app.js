@@ -1,3 +1,4 @@
+import './keys.js';
 // server/app.js — route definitions. See README for the full endpoint list.
 
 import { randomUUID } from 'node:crypto';

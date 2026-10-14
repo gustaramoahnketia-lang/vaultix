@@ -1,3 +1,5 @@
+import './keys.js';
+import { backupIfDue } from './db.js';
 // server/index.js — start here: `node server/index.js`
 import http from 'node:http';
 import path from 'node:path';
@@ -129,9 +131,7 @@ setInterval(() => { try { releaseDue(); } catch (err) { console.error('[VAULTIXg
 server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`VAULTIXgusTAR server listening on http://localhost:${PORT}`);
-  if (!process.env.VAULTIX_KEY_PEPPER) {
-    console.log('[VAULTIXgusTAR] NOTE: VAULTIX_KEY_PEPPER not set — see .env.example. Fine for local dev, required before any real deployment.');
-  }
+  backupIfDue();
 });
 
 export default server;

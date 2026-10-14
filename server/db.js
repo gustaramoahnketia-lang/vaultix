@@ -11,10 +11,30 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import os from 'node:os';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.VAULTIX_DATA_DIR || path.join(__dirname, '..', 'data');
+// Test runs (node --test sets NODE_TEST_CONTEXT) get their own temporary folder,
+// so they never write into a real vault.
+const IS_TEST = !!process.env.NODE_TEST_CONTEXT;
+// The default lives in your home folder, NOT inside the project. Replacing or
+// re-unzipping the project therefore never deletes your accounts.
+const DEFAULT_DIR = IS_TEST
+  ? fs.mkdtempSync(path.join(os.tmpdir(), 'vaultix-test-'))
+  : path.join(os.homedir(), 'VaultixData');
+export const DATA_DIR = process.env.VAULTIX_DATA_DIR || DEFAULT_DIR;
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_PATH = process.env.VAULTIX_DB_PATH || path.join(DATA_DIR, 'vaultix.db');
+export const DB_PATH = process.env.VAULTIX_DB_PATH || path.join(DATA_DIR, 'vaultix.db');
+
+// Older versions kept the database inside the project folder. If that copy exists
+// and the new location is empty, move it across once, so nothing is lost.
+const LEGACY_DB = path.join(__dirname, '..', 'data', 'vaultix.db');
+if (!IS_TEST && !process.env.VAULTIX_DATA_DIR && !process.env.VAULTIX_DB_PATH
+    && !fs.existsSync(DB_PATH) && fs.existsSync(LEGACY_DB)) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    if (fs.existsSync(LEGACY_DB + suffix)) fs.copyFileSync(LEGACY_DB + suffix, DB_PATH + suffix);
+  }
+  console.log(`[VAULTIXgusTAR] Copied your existing database to ${DB_PATH}`);
+}
 
 export const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA foreign_keys = ON;');
@@ -298,4 +318,26 @@ try { db.exec('ALTER TABLE walking_sessions ADD COLUMN session_seconds INTEGER')
 
 export function resetDatabaseForTests() {
   db.exec('DELETE FROM shares; DELETE FROM events; DELETE FROM walking_sessions; DELETE FROM active_walks; DELETE FROM activity_goals; DELETE FROM user_preferences; DELETE FROM emergency_access; DELETE FROM push_subscriptions; DELETE FROM reminder_deliveries; DELETE FROM vault_files; DELETE FROM security_events; DELETE FROM vault_items; DELETE FROM sessions; DELETE FROM users;');
+}
+
+/**
+ * Keeps one copy of the database per day for the last 14 days, in
+ * <data folder>/backups. Called once at server start, never during tests.
+ */
+export function backupIfDue() {
+  if (IS_TEST) return;
+  const dir = path.join(DATA_DIR, 'backups');
+  fs.mkdirSync(dir, { recursive: true });
+  const today = new Date().toISOString().slice(0, 10);
+  const target = path.join(dir, `vaultix-${today}.db`);
+  try {
+    if (!fs.existsSync(target)) {
+      db.exec('PRAGMA wal_checkpoint(FULL)');
+      fs.copyFileSync(DB_PATH, target);
+    }
+    const copies = fs.readdirSync(dir).filter((f) => /^vaultix-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort();
+    for (const f of copies.slice(0, -14)) fs.rmSync(path.join(dir, f), { force: true });
+  } catch (err) {
+    console.error('[VAULTIXgusTAR] Backup skipped:', err.message);
+  }
 }

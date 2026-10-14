@@ -26,8 +26,11 @@ const KEY_LEN = 32; // 256-bit keys throughout
 // hashed or used to derive a key. If the database is ever stolen but the
 // app's environment is not, offline cracking of password/PIN hashes still
 // requires the pepper. Unset in local dev — see .env.example.
+let activePepper = null;
+// Called once at start-up by server/keys.js, after the stored pepper is checked.
+export function setActivePepper(p) { activePepper = p; }
 function pepper() {
-  return process.env.VAULTIX_KEY_PEPPER || '';
+  return activePepper !== null ? activePepper : (process.env.VAULTIX_KEY_PEPPER || '');
 }
 
 export function randomBytes(n) {

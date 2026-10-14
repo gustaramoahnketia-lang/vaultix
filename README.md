@@ -1006,3 +1006,62 @@ it. Now the walk lives on the server:
 - Phone background behaviour (iOS and Android both limit location for background
   web apps).
 - Real-world GPS accuracy outdoors. The browser test used simulated positions.
+
+## 24. Accounts survive updates (data location and pepper)
+
+### Why accounts disappeared after updates
+
+1. The database was stored inside the project folder (`data/vaultix.db`). Replacing
+   the folder with a new copy of the project started the app with an empty database.
+2. `.env.example` shipped with a placeholder pepper. Copying it to `.env` on each
+   update replaced the real pepper, so accounts could not be opened even though
+   they still existed.
+3. The test suite loaded the real database, so running `npm test` added test
+   accounts to live data.
+
+### What changed
+
+- **Data location.** The database and its settings are in one stable folder in your
+  home directory: `VaultixData` (for example `C:\Users\<you>\VaultixData` on
+  Windows). Set `VAULTIX_DATA_DIR` to use a different folder.
+- **Pepper.** Saved once, in `keys.json` inside the data folder, on first start. The
+  app checks it on every start. If `.env` holds a different value, the app stops with
+  a clear message instead of locking your accounts.
+- **Placeholders ignored.** The old placeholder line in `.env` is treated as "not set".
+- **Daily backup.** One copy per day, kept for 14 days, in `VaultixData/backups`.
+- **Tests isolated.** Test runs use their own temporary folders and never touch
+  `VaultixData` or the project's `data` folder.
+- **Automatic move.** If an older database is found in the project's `data` folder and
+  the new location is empty, it is copied across on first start.
+
+### What you need to do once
+
+1. Stop the app.
+2. Keep your current `.env` as it is. Do not run `cp .env.example .env` again.
+3. If you replaced the project folder, copy your old `data\vaultix.db` (and the
+   `vaultix.db-wal` and `vaultix.db-shm` files if they exist) into `VaultixData`.
+   Create that folder first if it does not exist.
+4. Start the app with `npm start`. Log in with your usual email and password.
+
+### If an account will not open
+
+- If you see "VAULTIX_KEY_PEPPER in .env does not match", open `.env` and put back the
+  original `VAULTIX_KEY_PEPPER` value you had before. If you never set one, delete the
+  line and start again.
+- Do not generate a new pepper or create a new account to replace an existing one.
+
+### Verified
+
+- `tests/update-survival.test.js`: an account created in one process signs in from
+  separate processes, with no `.env` pepper and with the placeholder. A changed pepper
+  stops the app from starting, and a wrong password is still refused. Removing the
+  changed-pepper check makes this test fail.
+- The full suite: 159 of 159 pass, with no writes to `VaultixData` or the project
+  `data` folder.
+- A real start against a fresh data folder creates `keys.json`, the database, and the
+  daily backup in that folder.
+
+### Not verified
+
+- A real update on your own laptop with your existing data. Please follow the steps
+  above and test sign-in before deleting the old folder.
