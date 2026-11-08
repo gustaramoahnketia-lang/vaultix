@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Emergency access — VAULTIXgusTAR</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/brand/favicon-32.png" />
+<style>
+  body { min-height: 100vh; margin: 0; background: linear-gradient(180deg,#0F172A 0%,#111C36 100%); display: flex; align-items: center; justify-content: center; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif; color: #1E293B; }
+  .box { width: 100%; max-width: 460px; }
+  .card { background: #fff; border-radius: 16px; padding: 26px; box-shadow: 0 24px 60px rgba(0,0,0,.3); }
+  h1 { font-size: 17px; margin: 0 0 6px; color: #0F172A; }
+  p { font-size: 13.5px; line-height: 1.6; color: #475569; margin: 0 0 14px; }
+  button { font: inherit; font-weight: 600; font-size: 14px; border-radius: 10px; padding: 11px 16px; border: none; background: #2563EB; color: #fff; cursor: pointer; width: 100%; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .err { background: #FEF2F2; color: #DC2626; padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .ok { background: #F0FDF4; color: #16A34A; padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .item { border-top: 1px solid #E2E8F0; padding: 12px 0; }
+  .item:first-child { border-top: none; }
+  .k { font-size: 11.5px; font-weight: 700; color: #64748B; text-transform: uppercase; letter-spacing: .04em; margin-top: 6px; }
+  .v { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+  .note { text-align: center; color: #94A3B8; font-size: 12px; margin-top: 16px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="box">
+  <div style="text-align:center;margin-bottom:18px;color:#fff;">
+    <div style="font-weight:800;font-size:18px;">VAULTIXgusTAR</div>
+    <div style="font-size:12.5px;color:#94A3B8;margin-top:2px;">Emergency access</div>
+  </div>
+  <div class="card" id="content"><p>Loading…</p></div>
+  <div class="note">Your access code is read from the link and is never sent to the server in the address bar. Access opens only after the waiting period, and the owner can cancel it before then.</div>
+</div>
+<script>
+(function () {
+  var el = document.getElementById('content');
+  var params = new URLSearchParams(location.hash.slice(1));
+  var id = params.get('id'), secret = params.get('code');
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function err(msg) { return '<div class="err">' + esc(msg) + '</div>'; }
+  function post(path, body) {
+    return fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, body: j }; }); });
+  }
+  function render(status, bodyHtml) { el.innerHTML = bodyHtml; }
+
+  if (!id || !secret) {
+    render('bad', '<h1>This link is incomplete</h1><p>Open the full link you were given. It contains your access code after the # symbol.</p>');
+    return;
+  }
+
+  function showRequest() {
+    render('request',
+      '<h1>Request access</h1>' +
+      '<p>Requesting access starts the waiting period set by the owner. You will be able to view the vault only after it ends, unless the owner cancels the request first.</p>' +
+      '<button id="go">Request access</button>');
+    document.getElementById('go').onclick = doRequest;
+  }
+
+  function doRequest() {
+    var b = document.getElementById('go'); b.disabled = true; b.textContent = 'Requesting…';
+    post('/api/emergency/' + encodeURIComponent(id) + '/request', { secret: secret }).then(function (res) {
+      if (!res.ok) { render('err', err(res.body.error || 'That access could not be verified.') + '<button id="retry">Try again</button>'); document.getElementById('retry').onclick = showRequest; return; }
+      checkStatus();
+    });
+  }
+
+  function checkStatus() {
+    post('/api/emergency/' + encodeURIComponent(id) + '/status', { secret: secret }).then(function (res) {
+      if (!res.ok) { render('err', err(res.body.error || 'That access code could not be verified. Check the link you were given.')); return; }
+      var st = res.body.status;
+      if (st === 'invited') { showRequest(); return; }
+      if (st === 'requested') {
+        var when = res.body.releaseAt ? new Date(res.body.releaseAt).toLocaleString() : 'the end of the waiting period';
+        render('waiting', '<h1>Waiting period running</h1><p>Your request is recorded. Access opens on <b>' + esc(when) + '</b> unless the owner cancels it first.</p><p style="color:#64748B;">Come back to this link after that time and open it again.</p>');
+        return;
+      }
+      if (st === 'released') { fetchVault(); return; }
+      if (st === 'revoked') { render('revoked', err('The owner has removed this access.')); return; }
+      render('err', err('Something went wrong. Please try again later.'));
+    });
+  }
+
+  function fetchVault() {
+    post('/api/emergency/' + encodeURIComponent(id) + '/view', { secret: secret }).then(function (res) {
+      if (res.status === 200) { renderVault(res.body); return; }
+      render('err', err(res.body.error || 'The vault could not be opened. Please try again later.'));
+    });
+  }
+
+  function renderVault(data) {
+    var rows = (data.items || []).map(function (it) {
+      var fields = Object.keys(it.payload || {}).filter(function (k) { return it.payload[k] !== '' && it.payload[k] != null; })
+        .map(function (k) { return '<div class="k">' + esc(k) + '</div><div class="v">' + esc(it.payload[k]) + '</div>'; }).join('');
+      return '<div class="item"><div style="font-weight:700;font-size:14.5px;">' + esc(it.title) + '</div>' + fields + '</div>';
+    }).join('');
+    render('vault', '<h1>Vault contents</h1><p>Access was released by the owner. Handle this information carefully and close this page when you are done.</p>' +
+      (rows || '<p>The vault has no items.</p>'));
+  }
+
+  checkStatus();
+})();
+</script>
+</body>
+</html>
